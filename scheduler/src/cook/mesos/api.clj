@@ -650,7 +650,7 @@
                  (when expected-runtime
                    {:expected-runtime expected-runtime})
                  (when executor
-                   {:executor  executor})
+                   {:executor executor})
                  (when application
                    {:application application}))]
     (s/validate Job munged)

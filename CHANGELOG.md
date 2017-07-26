@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## [Unreleased]
 ### Added
+- Added support for allowing job to specify which executor (cook|mesos) to use, from @shamsimam
 - Added support for throttling rate of publishing instance progress updates, from @shamsimam
 
 ## [1.5.3] - 2017-07-17

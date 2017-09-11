@@ -4,11 +4,11 @@ jdk:
 services:
   - docker
 before_install:
+  - pyenv global 3.5.3
   - sudo apt-key adv --keyserver keyserver.ubuntu.com --recv E56151BF
-  - echo "deb http://repos.mesosphere.io/ubuntu/ precise main" | sudo tee /etc/apt/sources.list.d/mesosphere.list
+  - echo "deb https://repos.mesosphere.io/ubuntu/ trusty main" | sudo tee /etc/apt/sources.list.d/mesosphere.list
   - sudo apt-get update -qq
   - sudo apt-get install mesos -y </dev/null
-  - sudo apt-get install python3
 branches:
   only:
     - master
@@ -19,16 +19,10 @@ env:
     - MESOS_NATIVE_JAVA_LIBRARY=/usr/lib/libmesos.so
     - CLJ_HTTP_ASYNC_POOL_TEST_DURATION_MULTIPLIER=5
   matrix:
-    - COOK_EXECUTOR='1' TEST_DIR=executor DEPS_CMD='python3 setup.py install' TEST_CMD='python3 setup.py nosetests'
-    - COOK_EXECUTOR='1' TEST_DIR=scheduler DEPS_CMD='lein with-profiles +test deps' TEST_CMD='lein test :all'
-    - COOK_EXECUTOR='1' TEST_DIR=jobclient DEPS_CMD='mvn dependency:resolve' TEST_CMD='mvn test'
-    - COOK_EXECUTOR='1' TEST_DIR=simulator DEPS_CMD='travis/prepare_simulation.sh' TEST_CMD='travis/run_simulation.sh'
-    - COOK_EXECUTOR='1' TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh'
-    - COOK_EXECUTOR='0' TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh'
-    - COOK_EXECUTOR='1' TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh explicit'
+    - COOK_EXECUTOR='1' TEST_DIR=executor DEPS_CMD='pip install -e .[tests]' TEST_CMD='nosetests'
 matrix:
     fast_finish: true
     allow_failures:
       - env: COOK_EXECUTOR='1' TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh explicit'
-before_script: (cd $TEST_DIR && $DEPS_CMD)
-script: cd $TEST_DIR && $TEST_CMD
+before_script: bash -xc "pushd $TEST_DIR && $DEPS_CMD"
+script: bash -xc "pushd $TEST_DIR && $TEST_CMD"

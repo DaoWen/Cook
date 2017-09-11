@@ -3,7 +3,6 @@
 
 from setuptools import setup
 
-
 setup(
     name='cook-executor',
     version='0.1.0',
@@ -13,10 +12,12 @@ setup(
     keywords='cook-executor',
     packages=['cook'],
     test_suite='tests',
-    tests_require=[
-        'nose>=1.0'
-    ],
-    setup_requires=['nose>=1.0'],
+    extras_require={
+        'tests': [
+                'nose>=1.0'
+        ]
+    },
+    tests_require=['tests'],
     install_requires=['pymesos==0.2.12'],
     entry_points={
         'console_scripts': [

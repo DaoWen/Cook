@@ -352,6 +352,12 @@
    (s/optional-key :detailed) s/Bool
    (s/optional-key :partial) s/Bool})
 
+(def KillGroupsParams
+  "Schema for killing groups, allowing optionally for 'partial'
+  results, meaning that some uuids can be valid and others not"
+  {:uuid [s/Uuid]
+   (s/optional-key :partial) s/Bool})
+
 (def GroupResponse
   "A schema for a group http response"
   (-> Group
@@ -864,6 +870,22 @@
             expected-runtime (assoc :expected-runtime expected-runtime)
             executor (assoc :executor (name executor)))))
 
+(defn fetch-group-live-jobs
+  "Get all jobs from a group that are currently running or waiting (not complete)"
+  [db guuid]
+  (let [group (d/entity db [:group/uuid guuid])
+        jobs (:group/job group)
+        completed? #(-> % :job/state (= :job.state/completed))]
+    (remove completed? jobs)))
+
+(defn fetch-group-live-jobs
+  "Get all jobs from a group that are currently running or waiting (not complete)"
+  [db guuid]
+  (let [group (d/entity db [:group/uuid guuid])
+        jobs (:group/job group)
+        completed? #(-> % :job/state (= :job.state/completed))]
+    (remove completed? jobs)))
+
 (defn fetch-group-job-details
   [db guuid]
   (let [group (d/entity db [:group/uuid guuid])
@@ -1215,22 +1237,26 @@
     (catch Exception e
       [false {::error e}])))
 
-(defn read-groups-handler
+(defn groups-action-handler
   [conn task-constraints is-authorized-fn]
   (base-cook-handler
-    {:allowed-methods [:get]
+    {:allowed-methods [:get :delete]
      :allowed? (fn [ctx]
                  (let [user (get-in ctx [:request :authorization/user])
                        guuids (::guuids ctx)
                        group-user (fn [guuid] (-> (d/entity (db conn) [:group/uuid guuid])
                                                   :group/job first :job/user))
+                       request-method (get-in ctx [:request :request-method])
+                       action-name ({:get "view" :delete "kill"} request-method)
                        authorized? (fn [guuid] (is-authorized-fn user
-                                                                 (get-in ctx [:request :request-method])
+                                                                 request-method
                                                                  {:owner (group-user guuid) :item :job}))
                        unauthorized-guuids (mapv :uuid (remove authorized? guuids))]
                    (if (empty? unauthorized-guuids)
                      true
-                     [false {::error (str "You are not authorized to view access the following groups "
+                     [false {::error (str "You are not authorized to "
+                                          action-name
+                                          " the following groups "
                                           (str/join \space unauthorized-guuids))}])))
      :exists? (partial retrieve-groups conn)
      :handle-ok (fn [ctx]
@@ -1238,7 +1264,12 @@
                     (mapv #(merge (fetch-group-map (db conn) %)
                                   (fetch-group-job-details (db conn) %))
                           (::guuids ctx))
-                    (mapv #(fetch-group-map (db conn) %) (::guuids ctx))))}))
+                    (mapv #(fetch-group-map (db conn) %) (::guuids ctx))))
+     :delete! (fn [ctx]
+                (let [jobs (mapcat #(fetch-group-live-jobs (db conn) %)
+                                   (::guuids ctx))
+                      juuids (mapv :job/uuid jobs)]
+                  (cook.mesos/kill-job conn juuids)))}))
 
 ;;
 ;; /queue
@@ -1908,7 +1939,14 @@
                                :description "The groups were returned."}
                           400 {:description "Non-UUID values were passed."}
                           403 {:description "The supplied UUIDs don't correspond to valid groups."}}
-              :handler (read-groups-handler conn task-constraints is-authorized-fn)}}))
+              :handler (groups-action-handler conn task-constraints is-authorized-fn)}
+        :delete
+        {:summary "Kill all jobs within a set of groups"
+         :parameters {:query-params KillGroupsParams}
+         :responses {204 {:description "The groups' jobs have been marked for termination."}
+                     400 {:description "Non-UUID values were passed."}
+                     403 {:description "The supplied UUIDs don't correspond to valid groups."}}
+         :handler (groups-action-handler conn task-constraints is-authorized-fn)}}))
 
      (c-api/context
       "/failure_reasons" []

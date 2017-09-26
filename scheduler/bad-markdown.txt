@@ -1,0 +1,11 @@
+These lines in these files were not converted correctly:
+
+scheduler/README.asc:[TIP]
+scheduler/docs/configuration.asc:[TIP]
+scheduler/docs/scheduler-rest-api.asc:[NOTE]
+scheduler/docs/scheduler-rest-api.asc:[WARNING]
+scheduler/docs/scheduler-rest-api.asc:[TIP]
+scheduler/docs/scheduler-rest-api.asc:[TIP]
+scheduler/docs/scheduler-rest-api.asc:[TIP]
+
+Try using Blockquote with some formatting and/or emojis to get that effect instead.

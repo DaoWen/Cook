@@ -1,0 +1,483 @@
+== Overview
+
+The Job Scheduler Rest API makes the Job Scheduling capabilities of Cook
+available for general purpose batch computing applications. This
+documents the HTTP based REST scheduler API.
+
+\[NOTE\]
+========
+
+This API is designed to build applications. It is not meant for command line job submission of ad hoc jobs, nor does it provide utilities for tracking job status.
+==================================================================================================================================================================
+
+When using the Cook REST API, you're expected to track your jobs with
+your own database. For example, at Two Sigma, we just use an additional
+Datomic database to track higher-level data models that use these jobs.
+When using this API, your client should first persist the new job's uuid
+to its own database before submitting it to Cook. This way, if your
+request ends with a timeout or indeterminate result, you can try to
+resubmit the job with the same uuid. If the job was created
+successfully, the second submission will fail with an error message
+telling you that the first submission worked. This API is fundamentally
+idempotent, and built for high reliability at scale.
+
+If you are building an application on the JVM, you can use the Cook
+Jobsystem API directly (see JavaDoc). The Cook Jobsystem API currently
+handles the job uuid management and resubmission; however, it doesn't
+yet have hooks to persist these jobs to a database.
+
+=== Disclaimer
+
+The Cook Scheduler assumes all batch jobs are idempotent, that is,
+running an instance of a job several times will not impact the result.
+If this isn't the case for your workload, the Cook Scheduler may not be
+a good fit. Also, the Cook scheduler will rarely run multiple instances
+of a job at the same time. This was a deliberate design decision to
+ensure that jobs are scheduled with the minimum possible latency, rather
+than rarely failing to schedule a job for 5-10 minutes.
+
+=== Authentication for Job Submission
+
+Cook currently requires all requests to be "authenticated". Currently,
+Cook currently supports 3 different mechanisms for authentication:
+
+`:http-basic`:: This is the easiest authenication mode to get started
+with. Currently, there's no support for passwords--all passwords are
+accepted, which means that clients should be honest. Not that we have
+anything against password verification--pull requests welcome!
+
+`:kerberos`:: If you're already using Kerberos in your environment, this
+is a very convenient option for authenticating Cook requests. You'll
+need to set the `KRB5_KTNAME` environment variable for the cook process.
+You'll also need to set the `:hostname` and `:dns-name` correctly for
+the Kerberos service credential you passed via `KRB5_KTNAME`. TODO: you
+can't actually configure hostname or dns-name; these need to be
+reenabled for configuration.
+
+`:one-user`:: When you enable the `:one-user` authentication scheme, you
+provide the username that you'd like all jobs to run as. Note that this
+mode is meant for development only, since you can't take advantage of
+any of the fairness features of Cook without multiple users.
+
+\[WARNING\]
+===========
+
+In order to successfully launch a job, the user that the job is
+submitted to run as must exist on all the slaves that Cook might use.
+You'll see tasks fail with the Mesos message "executor terminated", and
+in the slave log, you'll see a message about "Failed to chown executor
+directory". You should make sure to use a user that's configured on all
+slaves. ====
+
+=== HTTP Endpoints
+
+This section lists the set of methods available in the Scheduler API.
+The Scheduler endpoint provides the ability to **launch**, **track** and
+**delete** jobs on your Mesos cluster.
+
+==== Launch a Job
+
+`POST /rawscheduler` (also requires a JSON body)
+
+The request body is list of job maps with each entry containing a map of
+the following:
+
+.Request JSON Schema \[options="header"\] |==== |JSON Key | Type |
+Description |`uuid` | string | a user provided UUID for tracking and
+referring to the job. |`command` | string | the command to run
+|`executor` | string \[cook|mesos\] | Flag to force use of the Cook
+executor / Mesos command executor. |`name` | string | name of the job
+|`priority` | integer | priority of the job. Should be between 0 and
+100, inclusive. |`max_retries` | integer | the maximum number of retries
+|`max_runtime` | long | the maximum running time of the job in
+milliseconds. An instance that runs for more than max\_runtime will be
+killed and job will be retried. |`expected_runtime` | long | the
+(optional) expected running time of the job in milliseconds. If
+provided, `expected_runtime` must be less than or equal to
+`max_runtime`. Currently, this value is being collected but not used by
+the scheduler. In the future, this will allow us to make better
+scheduling decisions (e.g. don't preempt a job that is expected to
+complete very soon). |`cpus` | double | number of requested cpus. |`mem`
+| double | MB of requested memory. |`gpus` | integer | Number of
+requested GPUs. Must be a whole number and support must be enabled in
+the config. |`ports` | integer | Number of ports that should be opened
+for the job. |`uris` | list of URI objects | A list of URIs that will be
+fetched into the container before launch. |`env` | JSON map | A map of
+environment variables to be provided to the job. |`constraints` | list |
+list of constraints in form \[attribute, operator, pattern\]
+|`disable_mea_culpa_retries` | boolean | Flag to disable mea culpa
+retries. If true, mea culpa retries will count against the job's retry
+count. |====
+
+.URI JSON Schema (see
+http://mesos.apache.org/documentation/latest/fetcher/\[the Mesos docs\]
+for details) \[options="header"\] |==== |JSON Key | Type | Description
+|`value` | string | The URI to fetch. Supports everything the Mesos
+fetcher supports, i.e. http://, https://, ftp://, file://, hdfs://
+|`executable` | boolean | Should the URI have the executable bit set
+after download? |`extract` | boolean | Should the URI be extracted (must
+be a tar.gz, zipfile, or similar) |`cache` | boolean | Mesos 0.23 and
+later only: should the URI be cached in the fetcher cache? |====
+
+.Sample request JSON to submit one job \[source,json\] ---- { "jobs" :
+\[ { "max\_retries" : 3, "max\_runtime": 86400000, "mem" : 1000, "cpus"
+: 1.5, "ports" : 3, "uuid" : "26719da8-394f-44f9-9e6d-8a17500f5109",
+"env" : { "MY\_VAR" : "foo" }, "uris" : \[ { "value":
+"http://example.com/my-executor.tar.gz", "extract": true } \],
+"constraints" : \[\["instance\_type", "EQUALS", "r3.8xlarge"\]\],
+"command" : "echo hello world" } \] } ----
+
+===== Constraints
+
+Constraints provide controls over where a job is placed on the cluster.
+There are both job and group level constraints. This will discuss job
+constraints, see the docs/groups.md for more details on group
+constraints.
+
+Constraints are specified as a tuple of attribute, operator, pattern.
+Attribute can be any attribute set on a host in the cluster. Cook
+currently only supports the EQUALS operator. In the future, we will add
+more operators. For the case of the EQUALS, Cook will only schedule a
+job on a host for which the attribute's value equals pattern.
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |201 | Created | Job has been successfully created.
+|400 | Malformed | This will be returned if the request syntax is not
+correct. |401 | Not Authorized | Returned if authentication fails or
+user is not authorized to run jobs on the system. |409 | Conflict |
+Returned if one or more of the job UUIDs was already in use. |500 |
+Server error | Returned if there is an error committing jobs to the Cook
+database. |====
+
+==== Query Status of a Job
+
+`GET /rawscheduler?(job|instance)=:uuid(&(job|instance)=:uuid)*`
+
+\[TIP\]
+=======
+
+You must provide at least one uuid as the `job` or `instance` argument, but you can repeat the `job` and `instance` arguments as many times as you'd like to batch the request.
+===============================================================================================================================================================================
+
+The API accepts a list of job or instance UUIDs that have been
+previously created as query parameters. If an instance UUID is passed,
+the result will contain the job corresponding to that instance. Jobs can
+only be in 3 states: `waiting`, `running`, or `completed`. This is
+because a job is supposed to run until it's finished--you can determine
+whether the job succeeded or failed by looking at its instances.
+Instances can be in 4 states: `unknown`, `running`, `success`, or
+`failed`. Instances are only launched when Cook recieves a resource
+offer; the `unknown` state covers the period between finding an offer
+and Mesos notifying that the job launched successfully. The `running`
+status indicates that the instance is still in progress; `success` and
+`failed` are based on the status of the task; typically, a command that
+returned an exit code of 0 will have status `success` and `failed`
+otherwise.
+
+Since a job could have multiple instances that run concurrently, it's
+possible to have both successful and failed instances of a completed
+job. Thus, it's up to the user to determine whether the job achieved the
+desired effects. The response body contains the following:
+
+.Response Body Schema \[options="header"\] |==== |`command`| The command
+submitted |`uuid` | the job UUID |`cpus` | the number of CPUs requested
+|`mem` | the amount of memory requested |`gpus` | the number of GPUs
+requested |`framework_id` | the Mesos framework ID of cook |`status` |
+the status of the job |`instances` | a list of job instance maps (see
+&lt;<instance_maps>&gt;) |====
+
+Where each instance contains a map with the following keys:
+
+\[\[instance\_maps\]\] .Job Instance Schema |==== |`start_time` |
+milliseconds since Unix epoch (will be absent if job hasn't started)
+|`end_time` | milliseconds since Unix epoch (will be absent if job
+hasn't ended) |`task_id` | Mesos task id |`hostname` | the host that the
+instance ran on |`ports` | the ports that were opened for the instance
+|`slave_id` | Mesos slave\_id |`executor_id` | Mesos executor\_id
+|`status` | current status of the instance; could be `unknown`,
+`running`, `success`, or `failed` |`output_url` | See
+&lt;<using_output_url>&gt;, (will be absent if the agent the job was run
+on is unable to return the necessary data, e.g. it is offline) |====
+
+\[\[using\_output\_url\]\] .Using the `output_url` \[TIP\] ==== The
+`output_url` allows you directly connect to the machine that is running
+or ran an instance and download arbitrary files from that instance's
+sandbox over HTTP. A common question is how to use the `output_url` of
+an instance to inspect and retrieve files from that instance. Suppose
+you wished to download the file `foo.txt` which was written to the root
+of the sandbox. Then, you would request the HTTP resource
+`"$output_url/foo.txt&offset=0"`. If you wanted the file
+`logs/data.log`, you'd request `"$output_url/logs/data.log&offset=0"`.
+The URL will return a JSON object with 2 fields: `data`, which is the
+requested data, and `length`, which is the length of the `data` field.
+
+The `output_url` API also supports pagination. Rather than always
+specifying `offset=0`, you can use whatever `offset` and `length`
+parameters you'd like, allowing you to download arbitrary slices of the
+files. Since the returned data always includes its length, a client can
+maintain a local offset and repeatedly poll for only the latest data.
+
+Don't forget that Mesos periodically garbage collects output directories--jobs should archive their results to a longer-term data store if longer-term access is neccessary.
+============================================================================================================================================================================
+
+The response will include Job details listed below:
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |400 | Malformed | This will be returned if non UUID
+values are passed as jobs |403 | Forbidden | This will be returned the
+supplied UUIDs don't correspond to valid jobs. | 404 | Not Found | The
+Job instance cannot be found. | 200 | OK | The job and its instances
+were returned |====
+
+==== Delete a Job
+
+This method will change the status of the job to "completed" and kill
+all the running instances of the job through `killTask` call to Mesos.
+Note the instances might not be killed immediately--during extreme
+network issues, it could take 20-30 minutes for jobs to be fully killed,
+because the `killTask` won't be resent until the periodic instance
+reaper runs again. The behavior of `killTask` depends on the
+implementation of the executor. When using the Mesos default command
+line executor, it will first send `SIGTERM` and then `SIGKILL`.
+
+`DELETE /rawscheduler?job=:uuid(&job=:uuid)*`
+
+\[TIP\]
+=======
+
+The `DELETE` verb also accepts multiple job uuids, just like `GET`.
+===================================================================
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |204 | No Content | The job has been marked for
+termination. |400 | Malformed | This will be returned if non UUID values
+are passed as jobs |403 | Forbidden | This will be returned the supplied
+UUIDs don't correspond to valid jobs. |====
+
+.Example Usage \[source,bash\] ---- curl -X DELETE -u: --negotiate
+"$scheduler_endpoint?job=$uuid" ----
+
+==== Retry a job
+
+This method will add retries to a job and set the status of the job to
+"waiting" if it is complete.
+
+`POST /retry?job=:uuid&retries=:num_retries`
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |204 | No Content | The job has had retries increased
+and been set to state "waiting" if complete. Returns the new number of
+retries |400 | Malformed | This will be returned if non UUID values are
+passed as jobs or retries is not a postitive integer or the UUID doesn't
+correspond to a job |403 | Forbidden | This is returned if the user is
+not authorized to retry the job |====
+
+.Example Usage \[source,bash\] ---- \$ curl -X POST -u: --negotiate
+$cook_uri/retry?job=$uuid&retry=10" 10 \# new retries ----
+
+==== List jobs
+
+This method will return a list of jobs run by a particular user over a
+specific time range. The data returned takes the same shape as getting
+jobs on the /rawscheduler endpoint.
+
+'GET
+/list?user=:user&state=:state1%2B:state2&start\_ms=:start&end\_ms=:end'
+
+.Query params \[options="header"\] |==== | param | type | Description |
+user | string | User name of user who ran the jobs | state | string |
+one or more states. states are split by "+" which url encodes to "%2B" |
+start-ms | long | millis since unix epoch time. Considers all jobs
+submitted after this time | end-ms | long | millis since unix epoch
+time. Considers all jobs submitted before this time | limit | int |
+Limits the number of jobs returned |====
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |200 | OK | List of jobs is returned |400 | Malformed
+| Something is wrong with inputs |403 | Forbidden | Not allowed to view
+those jobs or inputs are forbidden |====
+
+.Example Usage \[source,bash\] ---- \$ curl -u: --negotiate
+"$cook_uri/list?user=$USER&state=running&start\_ms=1400046374261&end\_ms=1578726374261"
+----
+
+=== Operator apis
+
+The following apis are intended for use by operators of cook because
+they allow setting system level propertries like the weight of users or
+the max resources a user is allows to have.
+
+==== User share
+
+Share in Cook encapsulates two ideas. The first is non-preemptable
+amount of resources a user is entitled to. All resources under their
+share will not be preempted. The second is to decide the weight between
+users based on DRU when making preemption decisions. See
+rebalancer-config.asc for more details.
+
+An operator can set a share per user or set a default share which
+applies to users without a share set.
+
+===== Get user's share
+
+`GET /share?user=:user`
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |200 | Ok | Returns the users share or the default
+share if the user doesn't have a share set. |400 | Malformed | Returned
+if a user is not specified |403 | Forbidden | This is returned if the
+user issuing the request is not authorized |====
+
+.Example Usage \[source,bash\] ---- \$ curl -u: --negotiate
+"$cook_uri/share?user=$user" {"mem" : 2500000, "cpus" : 400}
+
+Get default user share
+======================
+
+\$ curl -u: --negotiate "\$cook\_uri/share?user=default" {"mem" :
+2500000, "cpus" : 400} ----
+
+====== Set user's share
+
+`POST /share?user=:user` (also requires a JSON body)
+
+The request json is expected to be map, with a single key "share". The
+value should be valid resource types, such as "cpus" or "mem" (in MB)
+
+.Request JSON Schema \[options="header"\] |==== |JSON Key | Type |
+Description |`mem` | double | Memory in MB |`cpus` | double | Number of
+cpus |====
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |201 | Created | User share set. Returns the new share
+|400 | Malformed | This will be returned if no resource values are sent
+or if there is an unknown resource type |401 | Not Authorized | This is
+returned if the user issuing the request is not authorized |422 |
+Unprocessable Entity | Returned if there is an error committing jobs to
+the Cook database. |====
+
+.Sample request JSON to submit one job \[source,json\] ---- { "share" :
+{ "mem" : 1e8, "cpus" : 10000, } } ----
+
+.Example Usage \[source,bash\] ---- \$ curl -u: --negotiate -H
+"Content-type: application/json" --data '{"share": {"cpus": 10000}}'
+$cook_uri/share?user=$user" {"mem" : 2500000, "cpus" : 10000}
+
+Set default user share
+======================
+
+\$ curl -u: --negotiate -H "Content-type: application/json" --data
+'{"share": {"cpus": 10000}}' "\$cook\_uri/share?user=default" {"mem" :
+2500000, "cpus" : 10000} ----
+
+====== Retract a user's share
+
+To set a user's share back to the default, an operator can retract the
+share the user currently has assigned.
+
+`DELETE /share?user=:user`
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |204 | No Content | User's share was retracted |400 |
+Malformed | Returned if a user is not specified |403 | Forbidden | This
+is returned if the user issuing the request is not authorized |====
+
+.Example Usage \[source,bash\] ---- \$ curl -X DELETE -u: --negotiate
+"$cook_uri/share?user=$user" ----
+
+==== User quota
+
+Quota is the maximum resources or jobs a user will get scheduled at any
+time. Updating the quota will not preempt the jobs that are currently
+running.
+
+An operator can set a quota per user or set a default share which
+applies to users without a quota set.
+
+===== Get user's quota
+
+`GET /quota?user=:user`
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |200 | Ok | Returns the users quota or the default
+quota if the user doesn't have a quota set. |400 | Malformed | Returned
+if a user is not specified |403 | Forbidden | This is returned if the
+user issuing the request is not authorized |====
+
+.Example Usage \[source,bash\] ---- \$ curl -u: --negotiate
+"$cook_uri/quota?user=$user" {"mem" : 2500000, "cpus" : 400, "count" :
+1000}
+
+Get default user quota
+======================
+
+\$ curl -u: --negotiate "\$cook\_uri/quota?user=default" {"mem" :
+2500000, "cpus" : 400, "count" : 1000} ----
+
+====== Set user's quota
+
+`POST /quota?user=:user` (also requires a JSON body)
+
+The request json is expected to be map, with a single key "quota". The
+value should be valid resource types, such as "cpus", "mem" (in MB), or
+count
+
+.Request JSON Schema \[options="header"\] |==== |JSON Key | Type |
+Description |`mem` | double | Memory in MB |`cpus` | double | Number of
+cpus |`jobs` | integer | Number of jobs |====
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |201 | Created | User quota set. Returns the new quota
+|400 | Malformed | This will be returned if no resource values are sent
+or if there is an unknown resource type |401 | Not Authorized | This is
+returned if the user issuing the request is not authorized |422 |
+Unprocessable Entity | Returned if there is an error committing jobs to
+the Cook database. |====
+
+.Sample request JSON to submit one job \[source,json\] ---- { "quota" :
+{ "mem" : 1e8, "cpus" : 10000, "count" : 300 } } ----
+
+.Example Usage \[source,bash\] ---- \$ curl -u: --negotiate -H
+"Content-type: application/json" --data '{"quota": {"count": 1000}}'
+$cook_uri/quota?user=$user" {"mem" : 2500000, "cpus" : 400, "count" :
+1000}
+
+Set default user quota
+======================
+
+\$ curl -u: --negotiate -H "Content-type: application/json" --data
+'{"quota": {"count": 1000}}' "\$cook\_uri/quota?user=default" {"mem" :
+2500000, "cpus" : 400, "count" : 1000} ----
+
+====== Retract a user's quota
+
+To set a user's quota back to the default, an operator can retract the
+quota the user currently has assigned.
+
+`DELETE /quota?user=:user`
+
+.Possible response codes \[options="header"\] |==== |Code | HTTP Meaning
+| Possible reason |204 | No Content | User's quota was retracted |400 |
+Malformed | Returned if a user is not specified |403 | Forbidden | This
+is returned if the user issuing the request is not authorized |====
+
+.Example Usage \[source,bash\] ---- \$ curl -X DELETE -u: --negotiate
+"$cook_uri/quota?user=$user" ----
+
+\[swagger\]
+
+=== Swagger Specification
+
+====
+
+The API is described more precisely via Swagger.
+
+To access the JSON Swagger definition for the API, first start Cook, and
+request \$scheduler\_endpoint/swagger-docs.
+
+You can use Swagger-UI to explore the API (end even experiment with it) by browsing to \$scheduler\_endpoint/swagger-ui.
+========================================================================================================================
+
+=======
+
+© Two Sigma Open Source, LLC

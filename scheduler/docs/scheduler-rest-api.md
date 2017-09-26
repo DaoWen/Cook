@@ -85,7 +85,7 @@ the following:
 .Request JSON Schema \[options="header"\] |==== |JSON Key | Type |
 Description |`uuid` | string | a user provided UUID for tracking and
 referring to the job. |`command` | string | the command to run
-|`executor` | string \[cook|mesos\] | Flag to force use of the Cook
+|`executor` | string \[cook\|mesos\] | Flag to force use of the Cook
 executor / Mesos command executor. |`name` | string | name of the job
 |`priority` | integer | priority of the job. Should be between 0 and
 100, inclusive. |`max_retries` | integer | the maximum number of retries

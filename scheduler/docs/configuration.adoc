@@ -78,7 +78,7 @@ If need it to bind to another port, you can specify that with the `:local-port` 
   The value of this key is a set of usernames who should be considered administrators when using the `configfile-admins-auth` authorization-fn.
 
 `:rate-limit`::
-  Configure rate limits for the scheduler. `rate-limit` is a map with two possible keys, `user-limit-per-m`. `user-limit-per-m` is the max requests a single user can send in a minute. The default is 600 requests. 
+  Configure rate limits for the scheduler. `rate-limit` is a map with two possible keys, `user-limit-per-m`. `user-limit-per-m` is the max requests a single user can send in a minute. The default is 600 requests.
 
 `:agent-query-cache`::
   Configure the cache used to store sandbox locations of tasks on different mesos agents.
@@ -164,14 +164,14 @@ We'll look at the three authentication mechanisms supported:
 
 `:http-basic`::
   Most organizations will want to use HTTP Basic authentication.
-  Cook allows you to configure how the user name and password are configured. 
+  Cook allows you to configure how the user name and password are configured.
   Currently, Cook supports specifying the logins in the config file or using no validation
   This also makes it super easy to get started:
   to use HTTP Basic, simply use `{:http-basic true}` as your `:authorization`.
-  This will use no validation. 
+  This will use no validation.
   To use config-file validation, set `:authorization` to:
   `{:http-basic {:validation :config-file :valid-logins #{["user" "password"] ["user2" "password2"]}}}`
-  
+
 
 `:kerberos`::
   If you have Kerberos at your organization, then you can use it to authenticate users with Cook.
@@ -211,10 +211,10 @@ Example: +
   If Cook has been allowing Fenzo to see only 1 job for this number of iterations, warning messages will start to appear in the logs.  Default is 10.
 
 `:fenzo-floor-iterations-before-reset`::
-  If Cook has been allowing Fenzo to see only 1 job for this number of iterations, it measn that the cluster is essentially down.  In this case, Cook will log an error message and then reset the number of jobs Fenzo can see to the value of "fenzo-max-jobs-considered" (see above).
+  If Cook has been allowing Fenzo to see only 1 job for this number of iterations, it means that the cluster is essentially down.  In this case, Cook will log an error message and then reset the number of jobs Fenzo can see to the value of `:fenzo-max-jobs-considered` (see above).
 
-:fenzo-fitness-calculator::
-  By default, Cook will have Fenzo attempt to bin-pack using a combination of memory and CPU when choosing which hosts will field which tasks.  By choosing a different option in fenzo-fitness-calculator, you can specify that Fenzo should use a different implemention of https://github.com/Netflix/Fenzo/blob/master/fenzo-core/src/main/java/com/netflix/fenzo/VMTaskFitnessCalculator.java[VMTaskFitnessCalculator].  This value can either refer to a static member of a Java class on the classpath (e.g. "com.netflix.fenzo.plugins.BinPackingFitnessCalculators/cpuMemBinPacker", the default), or a namespaced clojure symbol (e.g. "cook.mesos.scheduler/dummy-fitness-calculator") 
+`:fenzo-fitness-calculator`::
+  By default, Cook will have Fenzo attempt to bin-pack using a combination of memory and CPU when choosing which hosts will field which tasks.  By choosing a different option in fenzo-fitness-calculator, you can specify that Fenzo should use a different implemention of https://github.com/Netflix/Fenzo/blob/master/fenzo-core/src/main/java/com/netflix/fenzo/VMTaskFitnessCalculator.java[VMTaskFitnessCalculator].  This value can either refer to a static member of a Java class on the classpath (e.g. `com.netflix.fenzo.plugins.BinPackingFitnessCalculators/cpuMemBinPacker`, the default), or a namespaced clojure symbol (e.g. `cook.mesos.scheduler/dummy-fitness-calculator`).
 
 `:task-constraints`::
   This option is a map that allows you to configure limits for tasks, to ensure that impossible-to-schedule tasks and tasks that run forever won't bog down your cluster.
@@ -226,20 +226,20 @@ Example: +
 
 Optionally, you can include a "rebalancer" stanza.  If you do, on startup, Cook will update its link:rebalancer-config.adoc[Rebalancer configuration] to match the values you specify here.
 
- :interval-seconds::
+`:interval-seconds`::
    How often to rebalance the cluster for fairness between users.  Default is 300 (5 minutes).
 
- :safe-dru-threshold::
-  See the link:rebalancer-config.adoc[Rebalancer documentation]
+`:safe-dru-threshold`::
+  See the link:rebalancer-config.adoc[Rebalancer documentation].
 
- :min-dru-diff::
-  See the link:rebalancer-config.adoc[Rebalancer documentation]
+`:min-dru-diff`::
+  See the link:rebalancer-config.adoc[Rebalancer documentation].
 
- :max-preemption::
-  See the link:rebalancer-config.adoc[Rebalancer documentation]
+`:max-preemption`::
+  See the link:rebalancer-config.adoc[Rebalancer documentation].
 
- :min-utilization-threshold::
-  See the link:rebalancer-config.adoc[Rebalancer documentation]
+`:min-utilization-threshold`::
+  See the link:rebalancer-config.adoc[Rebalancer documentation].
 
 `:dru-scale`::
   This is only used to control the metrics reporting of DRU values.  On some clusters,
@@ -271,7 +271,7 @@ Optionally, you can include a "rebalancer" stanza.  If you do, on startup, Cook 
 `:cpus`::
   This is just like `:memory-gb`, but for CPUs.
   You should make sure this is small enough that users can't accidentally submit tasks that are too big for your slaves.
-  
+
 `:retry-limit`::
   This limits the number of retries a job is allowed to request. Something in the low tens is often more than sufficient.
 
@@ -285,7 +285,8 @@ Please see the link:../../executor/README.md[Cook Executor README] for more deta
 
 An example configuration looks like:
 
-```clojure
+[source,clojure]
+----
 {...
  :executor {:command "cook-executor"
             :default-progress-output-file "stdout"
@@ -298,7 +299,7 @@ An example configuration looks like:
                   :extract false
                   :value "file:///path/to/cook-executor"}}
  ...}
-```
+----
 
 The configuration values are defined as follows:
 
@@ -352,13 +353,14 @@ This also protects the scheduler against potentially bad executors that are send
 
 An example configuration looks like:
 
-```clojure
+[source,clojure]
+----
 {...
  :progress {:batch-size 100
             :pending-threshold 4000
             :publish-interval-ms 2500}
  ...}
-```
+----
 
 The configuration values are defined as follows:
 

@@ -667,6 +667,8 @@
   "Lazily filters jobs for which the sum of running jobs and jobs earlier in the queue exceeds one of the constraints,
    max-jobs, max-cpus or max-mem"
   [user->quota user->usage queue]
+  ; WIP - need to update this function so it also checks if non-preemptable jobs
+  ; exceed the share constraints (not just the quota)
   (letfn [(filter-with-quota [user->usage job]
             (let [user (:job/user job)
                   job-usage (job->usage job)

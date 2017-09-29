@@ -694,7 +694,7 @@
   "Limit the pending jobs to considerable jobs based on usage and quota.
    Further limit the considerable jobs to a maximum of num-considerable jobs."
   [db category->pending-jobs user->quota user->usage num-considerable]
-  (log/debug "There are" (apply + (map count category->pending-jobs)) "pending jobs")
+  (log/debug "There are" (apply + (map (comp count val) category->pending-jobs)) "pending jobs")
   (log/debug "pending-jobs:" category->pending-jobs)
   (let [filter-considerable-jobs (fn filter-considerable-jobs [jobs]
                                    ; WIP - Shams suggested filtering out unplacable non-preemptive jobs

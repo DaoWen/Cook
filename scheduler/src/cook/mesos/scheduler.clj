@@ -695,6 +695,9 @@
   (log/debug "There are" (apply + (map count category->pending-jobs)) "pending jobs")
   (log/debug "pending-jobs:" category->pending-jobs)
   (let [filter-considerable-jobs (fn filter-considerable-jobs [jobs]
+                                   ; WIP - Shams suggested filtering out unplacable non-preemptive jobs
+                                   ; so that they're not even considered for placement, which avoids some starvation issues.
+                                   ; This looks like the right place to make that change.
                                    (->> jobs
                                         (filter-based-on-quota user->quota user->usage)
                                         (filter (fn [job]

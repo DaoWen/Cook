@@ -168,6 +168,13 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/cardinality :db.cardinality/one
     :db.install/_attribute :db.part/db
     :db/doc "Whether a summary of Fenzo placement failures should be recorded for the job at next opportunity."}
+   {:db/id (d/tempid :db.part/db)
+    :db/ident :job/non-preemptable
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db.install/_attribute :db.part/db
+    :db/doc "Flag to disable preemption of a job, guaranteeing it will finish once started (in absence of failures).
+This guarantee implies additional restrictions on when the job may be scheduled."}
    ;; Group attributes
    {:db/id (d/tempid :db.part/db)
     :db/ident :group/uuid

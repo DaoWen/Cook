@@ -694,7 +694,7 @@
   "Limit the pending jobs to considerable jobs based on usage and quota.
    Further limit the considerable jobs to a maximum of num-considerable jobs."
   [db category->pending-jobs user->quota user->usage num-considerable]
-  (log/debug "There are" (apply + (map (comp count val) category->pending-jobs)) "pending jobs")
+  (log/debug "There are" (reduce + (map (comp count val) category->pending-jobs)) "pending jobs")
   (log/debug "pending-jobs:" category->pending-jobs)
   (let [filter-considerable-jobs (fn filter-considerable-jobs [jobs]
                                    ; WIP - Shams suggested filtering out unplacable non-preemptive jobs
@@ -716,7 +716,7 @@
   [matches]
   (let [category->jobs (group-by util/categorize-job
                                  (->> matches
-                                      (mapcat #(-> % :tasks))
+                                      (mapcat :tasks)
                                       (map #(-> % .getRequest :job))))
         category->job-uuids (pc/map-vals #(set (map :job/uuid %)) category->jobs)]
     (log/debug "matched jobs:" (pc/map-vals count category->job-uuids))
@@ -1241,7 +1241,7 @@
   ;; The unfiltered db can also be used on pending job entities once the filtered db is used to limit
   ;; to only those jobs that have been committed.
   (let [category->pending-job-ents (group-by util/categorize-job (util/get-pending-job-ents unfiltered-db))
-        category->pending-task-ents (pc/map-vals #(map util/create-task-ent %1) category->pending-job-ents)
+        category->pending-task-ents (pc/map-vals util/create-task-ent category->pending-job-ents)
         category->running-task-ents (group-by (comp util/categorize-job :job/_instance)
                                               (util/get-running-task-ents unfiltered-db))
         user->dru-divisors (share/create-user->share-fn unfiltered-db)

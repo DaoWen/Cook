@@ -503,6 +503,7 @@
       (fn []
         (log/info "Rebalance cycle starting")
         (let [params (read-datomic-params conn)
+              _ (log/info "PARAMS:" params)
               utilization (get-mesos-utilization)
               host->spare-resources (->> (view-incubating-offers)
                                          (map (fn [v]

@@ -1,8 +1,8 @@
 minimesos {
     clusterName = "cook"
     loggingLevel = "INFO"
-    mapAgentSandboxVolume = false
-    mapPortsToHost = true
+    mapAgentSandboxVolume = true
+    mapPortsToHost = false
     mesosVersion = "1.0.0"
     timeout = 60
 
@@ -74,10 +74,10 @@ minimesos {
 
     // Minimesos currently has an NPE without marathon
     // https://github.com/ContainerSolutions/minimesos/issues/532
-    marathon {
-        imageName = "mesosphere/marathon"
-        imageTag = "v1.3.5"
-    }
+    //marathon {
+    //    imageName = "mesosphere/marathon"
+    //    imageTag = "v1.3.5"
+    //}
 
     zookeeper {
         imageName = "jplock/zookeeper"

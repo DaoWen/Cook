@@ -24,10 +24,13 @@ WORKDIR /opt/cook
 ## with fetched dependencies as long as project.clj isn't modified
 RUN lein deps
 
+RUN apt-get -y install tmux vim
+
 # Copy the whole scheduler into the container
 COPY . /opt/cook/
 
 # Run cook
 EXPOSE 12321
-ENTRYPOINT ["lein", "with-profiles", "+docker", "run"]
-CMD ["container-config.edn"]
+#ENTRYPOINT ["lein", "with-profiles", "+docker", "run"]
+#CMD ["container-config.edn"]
+ENTRYPOINT ["tmux", "new-session", "bash -c 'lein with-profiles +docker run container-config.edn; bash'"]

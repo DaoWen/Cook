@@ -264,54 +264,6 @@ def wait_for_exit_code(cook_url, job_id):
     return response.json()[0]
 
 
-def wait_until(query, predicate, max_wait_ms=30000):
-    @retry(stop_max_delay=max_wait_ms, wait_fixed=1000)
-    def wait_until_inner():
-        response = query()
-        error_msg = None
-        if not predicate(response):
-            error_msg = "wait_until condition not yet met, retrying..."
-            logger.info(error_msg)
-            raise RuntimeError(error_msg)
-        else:
-            logger.info("wait_until condition satisfied")
-            return response
-
-    try:
-        return wait_until_inner()
-    except:
-        final_response = query()
-        logger.info("Timeout exceeded waiting for condition. Details: %s" % final_response)
-        raise
-
-
-def jobs_list_query(url, jobs, assert_response=False):
-    """
-    Helper method used with the wait_until function.
-    Looks up all the jobs in a list to get an updated status
-    as well as info on all of the current instances.
-    Note that the jobs argument is a list of job objects, not just the UUIDs.
-    """
-    response = query_jobs(url, job=[ job['uuid'] for job in jobs ])
-    if assert_response:
-        assert 200 == response.status_code
-    return response
-
-
-def all_instances_killed(response):
-    """
-    Helper method used with the wait_until function.
-    Checks a response from jobs_list_query to see if all jobs and instances have been killed.
-    """
-    for job in response.json():
-        if job['state'] != 'failed':
-            return False
-        for inst in job['instances']:
-            if inst['status'] != 'failed':
-                return False
-    return True
-
-
 def get_mesos_state(mesos_url):
     """
     Queries the state.json from mesos

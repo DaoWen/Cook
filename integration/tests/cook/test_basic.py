@@ -771,67 +771,70 @@ class CookTest(unittest.TestCase):
             self.assertIn(k, group_info)
 
     def test_group_kill_simple(self):
-        # Create and submit jobs in group
-        slow_job_wait = 1200
-        group_spec = self.minimal_group()
-        job_fast = util.minimal_job(group=group_spec['uuid'])
-        job_slow = util.minimal_job(group=group_spec['uuid'],
-                                    command='sleep %d' % slow_job_wait)
-        data = {'jobs': [job_fast, job_slow], 'groups': [group_spec]}
-        resp = util.session.post('%s/rawscheduler' % self.cook_url, json=data)
-        self.assertEqual(resp.status_code, 201)
-        # Wait for the short job to finish
-        util.wait_for_job(self.cook_url, job_fast['uuid'], 'completed')
-        # Now try to cancel the group (just the long job)
-        resp = util.session.delete('%s/group?uuid=%s' % (self.cook_url, group_spec['uuid']))
-        self.assertEqual(resp.status_code, 204)
-        # Wait for the slow job (and its instance) to die
-        util.wait_until(lambda: util.jobs_list_query(self.cook_url, [job_slow]), util.all_instances_killed)
-        # The fast job should have Success, slow job Failed (because we killed it)
-        jobs = util.session.get('%s/rawscheduler?job=%s&job=%s' %
-                                (self.cook_url, job_fast['uuid'], job_slow['uuid']))
-        self.assertEqual(200, jobs.status_code)
-        jobs = jobs.json()
-        self.assertEqual('success', jobs[0]['state'], 'Job details: %s' % (json.dumps(jobs[0], sort_keys=True)))
-        self.assertEqual('failed', jobs[1]['state'], 'Job details: %s' % (json.dumps(jobs[1], sort_keys=True)))
-        self.assertEqual(CookTest.CMD_NON_ZERO_EXIT_REASON, jobs[1]['instances'][0]['reason_code'])
-        # Now try to kill the group again
-        # (ensure it still works when there are no live jobs)
-        resp = util.session.delete('%s/group?uuid=%s' % (self.cook_url, group_spec['uuid']))
-        self.assertEqual(resp.status_code, 204)
-
-    def test_group_kill_multi(self):
-        # Create and submit jobs in group
         slow_job_wait = 1200
         group_spec = self.minimal_group()
         group_uuid = group_spec['uuid']
-        jobs = util.minimal_jobs(10, group=group_uuid,
-                                 command='sleep %d' % slow_job_wait)
-        data = {'jobs': jobs, 'groups': [group_spec]}
-        resp = util.session.post('%s/rawscheduler' % self.cook_url, json=data)
-        self.assertEqual(resp.status_code, 201)
-        # Wait for some job to start
-        def some_job_started(group_response):
-            group = group_response.json()[0]
-            running_count = group['running']
-            self.logger.info("Currently {:d} jobs running in group {}"
-                             .format(running_count, group['uuid']))
-            return running_count > 0
-        def group_detail_query():
-            response = util.query_groups(self.cook_url, uuid=[group_uuid], detailed='true')
-            self.assertEqual(200, response.status_code)
-            return response
-        util.wait_until(group_detail_query, some_job_started)
-        # Now try to kill the whole group
-        resp = util.session.delete('%s/group?uuid=%s' % (self.cook_url, group_spec['uuid']))
-        self.assertEqual(resp.status_code, 204)
-        # Wait for all the jobs to die
-        # Ensure that each job Failed (because we killed it)
-        util.wait_until(lambda: util.jobs_list_query(self.cook_url, jobs), util.all_instances_killed)
-        # Now try to kill the group again
-        # (ensure it still works when there are no live jobs)
-        resp = util.session.delete('%s/group?uuid=%s' % (self.cook_url, group_spec['uuid']))
-        self.assertEqual(resp.status_code, 204)
+        try:
+            # Create and submit jobs in group
+            job_fast = util.minimal_job(group=group_spec['uuid'])
+            job_slow = util.minimal_job(group=group_spec['uuid'],
+                                        command=f'sleep {slow_job_wait}')
+            data = {'jobs': [job_fast, job_slow], 'groups': [group_spec]}
+            resp = util.session.post(f'{self.cook_url}/rawscheduler', json=data)
+            self.assertEqual(resp.status_code, 201)
+            # Wait for the short job to finish
+            util.wait_for_job(self.cook_url, job_fast['uuid'], 'completed')
+            # Now try to cancel the group (just the long job)
+            resp = util.session.delete(f'{self.cook_url}/group?uuid={group_uuid}')
+            self.assertEqual(resp.status_code, 204)
+            # Wait for the slow job (and its instance) to die
+            query = lambda: util.query_jobs(self.cook_url, job=[job_slow])
+            util.wait_until(query, util.all_instances_killed)
+            # The fast job should have Success, slow job Failed (because we killed it)
+            jobs = util.query_jobs(self.cook_url, True, job=[job_fast, job_slow]).json()
+            self.assertEqual('success', jobs[0]['state'], f'Job details: {json.dumps(jobs[0], sort_keys=True)}')
+            self.assertEqual('failed',  jobs[1]['state'], f'Job details: {json.dumps(jobs[1], sort_keys=True)}')
+            self.assertEqual(CookTest.CMD_NON_ZERO_EXIT_REASON, jobs[1]['instances'][0]['reason_code'])
+        finally:
+            # Now try to kill the group again
+            # (ensure it still works when there are no live jobs)
+            resp = util.session.delete(f'{self.cook_url}/group?uuid={group_uuid}')
+            self.assertEqual(resp.status_code, 204)
+
+    def test_group_kill_multi(self):
+        slow_job_wait = 1200
+        group_spec = self.minimal_group()
+        group_uuid = group_spec['uuid']
+        try:
+            # Create and submit jobs in group
+            jobs = util.minimal_jobs(10, group=group_uuid,
+                                     command=f'sleep {slow_job_wait}')
+            data = {'jobs': jobs, 'groups': [group_spec]}
+            resp = util.session.post(f'{self.cook_url}/rawscheduler', json=data)
+            self.assertEqual(resp.status_code, 201)
+            # Wait for some job to start
+            def some_job_started(group_response):
+                group = group_response.json()[0]
+                running_count = group['running']
+                self.logger.info(f"Currently {running_count} jobs running in group {group['uuid']}")
+                return running_count > 0
+            def group_detail_query():
+                response = util.query_groups(self.cook_url, uuid=[group_uuid], detailed='true')
+                self.assertEqual(200, response.status_code)
+                return response
+            util.wait_until(group_detail_query, some_job_started)
+            # Now try to kill the whole group
+            resp = util.session.delete(f'{self.cook_url}/group?uuid={group_uuid}')
+            self.assertEqual(resp.status_code, 204)
+            # Wait for all the jobs to die
+            # Ensure that each job Failed (because we killed it)
+            query = lambda: util.query_jobs(self.cook_url, job=jobs)
+            util.wait_until(query, util.all_instances_killed)
+        finally:
+            # Now try to kill the group again
+            # (ensure it still works when there are no live jobs)
+            resp = util.session.delete(f'{self.cook_url}/group?uuid={group_uuid}')
+            self.assertEqual(resp.status_code, 204)
 
     def test_400_on_group_query_without_uuid(self):
         resp = util.query_groups(self.cook_url)

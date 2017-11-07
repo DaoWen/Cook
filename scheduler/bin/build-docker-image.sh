@@ -11,6 +11,8 @@ COOK_EXECUTOR_FILE=${EXECUTOR_DIR}/dist/cook-executor-docker
 SCHEDULER_EXECUTOR_DIR=${SCHEDULER_DIR}/resources/public
 SCHEDULER_EXECUTOR_FILE=${SCHEDULER_EXECUTOR_DIR}/cook-executor-docker
 
+set -e
+
 ${EXECUTOR_DIR}/bin/prepare-executor.sh docker ${SCHEDULER_EXECUTOR_DIR}
 
 echo "Building docker images for ${NAME}"

@@ -60,10 +60,19 @@ fi
 
 binary_app=./dist/cook-executor
 
-if [ -e $binary_app ]; then
-    installed_version="$(docker run -v $(pwd):/opt/cook python:3.5 /opt/cook/$binary_app --version)"
-else
+host_platform_matches_docker() {
+    # Our docker images all use Linux/x64 images
+    test 'Linux x86_64' == "$(uname -s) $(uname -m)"
+}
+
+if ! [ -e $binary_app ]; then
     installed_version=none
+elif host_platform_matches_docker; then
+    installed_version="$($binary_app --version)"
+else
+    docker create --rm --name cook-exec-version-check python:3.5 /root/$(basename $binary_app) --version
+    docker cp $binary_app cook-exec-version-check:/root
+    installed_version="$(docker start -a cook-exec-version-check)"
 fi
 
 #

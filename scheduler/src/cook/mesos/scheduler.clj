@@ -948,7 +948,7 @@
                   ;; This check ensures that, although we value Fenzo's optimizations,
                   ;; we also value Cook's sensibility of fairness when deciding which jobs
                   ;; to schedule.  If Fenzo produces a set of matches that doesn't include
-                  ;; Cook's highest-priority job, on the next cycle, we give Fenzo it less
+                  ;; Cook's highest-priority job, on the next cycle, we give Fenzo less
                   ;; freedom in the form of fewer jobs to consider.
                   (if matched-head?
                     max-considerable

@@ -1363,24 +1363,25 @@
   (base-cook-handler
     {:allowed-methods [:get :delete]
      :allowed? (fn [ctx]
-                 (let [user (get-in ctx [:request :authorization/user])
-                       guuids (::guuids ctx)
-                       group-user (fn [guuid] (-> (d/entity (db conn) [:group/uuid guuid])
-                                                  :group/job first :job/user))
-                       request-method (get-in ctx [:request :request-method])
-                       authorized? (fn [guuid] (is-authorized-fn user
-                                                                 request-method
-                                                                 {:owner (group-user guuid) :item :job}))
-                       unauthorized-guuids (mapv :uuid (remove authorized? guuids))]
-                   (if (empty? unauthorized-guuids)
-                     true
-                     [false {::error (str "You are not authorized to "
-                                          (case request-method
-                                            :get "view"
-                                            :delete "kill")
-                                          " the following groups "
-                                          (str/join \space unauthorized-guuids))}])))
-     :exists? (partial retrieve-groups conn)
+                 (let [[req-ok {guuids ::guuids} :as result] (retrieve-groups conn ctx)]
+                   (if-not req-ok
+                     result ; had error retrieving group uuids
+                     (let [user (get-in ctx [:request :authorization/user])
+                           group-user (fn [guuid] (-> (d/entity (db conn) [:group/uuid guuid])
+                                                      :group/job first :job/user))
+                           request-method (get-in ctx [:request :request-method])
+                           authorized? (fn [guuid] (is-authorized-fn user
+                                                                     request-method
+                                                                     {:owner (group-user guuid) :item :job}))
+                           unauthorized-guuids (mapv :uuid (remove authorized? guuids))]
+                       (if (empty? unauthorized-guuids)
+                         result ; cache ::guuids in the context
+                         [false {::error (str "You are not authorized to "
+                                              (case request-method
+                                                :get "view"
+                                                :delete "kill")
+                                              " the following groups "
+                                              (str/join \space unauthorized-guuids))}])))))
      :handle-ok (fn [ctx]
                   (if (Boolean/valueOf (get-in ctx [:request :query-params "detailed"]))
                     (mapv #(merge (fetch-group-map (db conn) %)

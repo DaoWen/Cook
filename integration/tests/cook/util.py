@@ -260,7 +260,7 @@ def multi_cluster_tests_enabled():
     return os.getenv('COOK_MULTI_CLUSTER') is not None
 
 
-def wait_until(query, predicate, max_wait_ms=60000, wait_interval_ms=1000):
+def wait_until(query, predicate, desc="condition", max_wait_ms=60000, wait_interval_ms=1000):
     """
     Block until the predicate is true for the result of the provided query.
     `query` is a thunk (nullary callable) that may be called multiple times.
@@ -273,11 +273,11 @@ def wait_until(query, predicate, max_wait_ms=60000, wait_interval_ms=1000):
     def wait_until_inner():
         response = query()
         if not predicate(response):
-            error_msg = "wait_until condition not yet met, retrying..."
+            error_msg = f"wait_until {desc} not yet met, retrying..."
             logger.debug(error_msg)
             raise RuntimeError(error_msg)
         else:
-            logger.info("wait_until condition satisfied")
+            logger.info(f"wait_until {desc} satisfied")
             return response
 
     try:

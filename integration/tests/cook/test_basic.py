@@ -42,6 +42,7 @@ class CookTest(unittest.TestCase):
             self.assertIsNotNone(job['instances'][0]['output_url'], message)
             self.assertIsNotNone(job['instances'][0]['sandbox_directory'], message)
 
+    @attr('explicit')
     def test_no_cook_executor_on_subsequent_instances(self):
         job_uuid, resp = util.submit_job(self.cook_url, command='exit 1', max_retries=10) # should launch many instances
         self.assertEqual(resp.status_code, 201, msg=resp.content)
@@ -261,6 +262,7 @@ class CookTest(unittest.TestCase):
             self.assertEqual(80, job['instances'][0]['progress'], message)
             self.assertEqual('80%', job['instances'][0]['progress_message'], message)
 
+    @attr('explicit')
     def test_max_runtime_exceeded(self):
         job_executor_type = util.get_job_executor_type(self.cook_url)
         settings_timeout_interval_minutes = util.get_in(util.settings(self.cook_url), 'task-constraints',

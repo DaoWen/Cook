@@ -31,7 +31,7 @@ env:
     - COOK_EXECUTOR=1 TEST_DIR=jobclient DEPS_CMD='mvn dependency:resolve' TEST_CMD='mvn test'
     - COOK_EXECUTOR=1 TEST_DIR=simulator DEPS_CMD='travis/prepare_simulation.sh' TEST_CMD='travis/run_simulation.sh'
     - COOK_EXECUTOR=1 TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh'
-    - COOK_EXECUTOR=0 TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh'
+    - COOK_EXECUTOR=0 TEST_DIR=integration DEPS_CMD='travis/prepare_integration.sh' TEST_CMD='travis/run_integration.sh --auth http-basic'
 matrix:
     fast_finish: true
     allow_failures:

@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 session = importlib.import_module(os.getenv('COOK_SESSION_MODULE', 'requests')).Session()
 session.headers['User-Agent'] = f"Cook-Scheduler-Integration-Tests ({session.headers['User-Agent']})"
 
+
 DEFAULT_TIMEOUT_MS = 120000
 
 
@@ -22,6 +23,52 @@ def continuous_integration():
 
 def has_docker_service():
     return os.path.exists('/var/run/docker.sock')
+
+
+_cook_info = None
+
+
+class User(object):
+    def __init__(self, name):
+        self.name = name
+        self.auth = (name, '')
+        self.previous_auth = None
+    def __enter__(self):
+        global session
+        logger.debug(f"Switching to user {self.name}")
+        assert self.previous_auth is None
+        self.previous_auth = session.auth
+        session.auth = self.auth
+    def __exit__(self, ex_type, ex_val, ex_trace):
+        global session
+        logger.debug(f"Switching back from user {self.name}")
+        assert self.previous_auth is not None
+        session.auth = self.previous_auth
+        self.previous_auth = None
+
+default_user = User('root')
+
+
+def multi_cluster_tests_enabled():
+    return os.getenv('COOK_MULTI_CLUSTER') is not None
+
+
+def _cook_auth_scheme():
+    global _cook_info
+    if _cook_info is None:
+        cook_url = retrieve_cook_url()
+        _wait_for_cook(cook_url)
+        _cook_info = scheduler_info(cook_url)
+        logger.info(f"Cook's authentication scheme is {_cook_info['authentication-scheme']}")
+    return _cook_info['authentication-scheme']
+
+
+def http_basic_auth_enabled():
+    return 'http-basic' == _cook_auth_scheme()
+
+
+def multi_user_tests_enabled():
+    return http_basic_auth_enabled()
 
 
 def get_in(dct, *keys):
@@ -67,7 +114,7 @@ def retrieve_cook_url(varname='COOK_SCHEDULER_URL', value='http://localhost:1232
 def retrieve_mesos_url(varname='MESOS_PORT', value='5050'):
     mesos_port = os.getenv(varname, value)
     cook_url = retrieve_cook_url()
-    wait_for_cook(cook_url)
+    _wait_for_cook(cook_url)
     mesos_master_hosts = settings(cook_url).get('mesos-master-hosts', ['localhost'])
     resp = session.get('http://%s:%s/redirect' % (mesos_master_hosts[0], mesos_port), allow_redirects=False)
     if resp.status_code != 307:
@@ -92,10 +139,17 @@ def is_connection_error(exception):
 
 
 @retry(retry_on_exception=is_connection_error, stop_max_delay=240000, wait_fixed=1000)
-def wait_for_cook(cook_url):
+def _wait_for_cook(cook_url):
     logger.debug('Waiting for connection to cook...')
     # if connection is refused, an exception will be thrown
     session.get(cook_url)
+
+
+def init_cook_session(*cook_urls):
+    for cook_url in cook_urls:
+        _wait_for_cook(cook_url)
+    if http_basic_auth_enabled():
+        session.auth = default_user.auth
 
 
 def settings(cook_url):
@@ -170,12 +224,12 @@ def retry_jobs(cook_url, assert_response=True, use_deprecated_post=False, **kwar
     return response
 
 
-def kill_jobs(cook_url, jobs, assert_response=True):
+def kill_jobs(cook_url, jobs, assert_response=True, expected_status_code=204):
     """Kill one or more jobs"""
     params = {'job': [unpack_uuid(j) for j in jobs]}
     response = session.delete(f'{cook_url}/rawscheduler', params=params)
     if assert_response:
-        assert 204 == response.status_code, response.content
+        assert expected_status_code == response.status_code, response.content
     return response
 
 

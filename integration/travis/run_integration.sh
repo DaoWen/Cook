@@ -7,6 +7,26 @@
 set -ev
 
 PYTEST_MARKS=''
+COOK_AUTH=one-user
+
+case "$1" in
+  --auth)
+    COOK_AUTH="$2"
+    shift 2
+    ;;
+esac
+
+case "$COOK_AUTH" in
+  http-basic)
+    CONFIG_FILE="scheduler_http_basic_config.edn"
+    ;;
+  one-user)
+    CONFIG_FILE="scheduler_config.edn"
+    ;;
+  *)
+    echo "Unrecognized auth scheme: $COOK_AUTH"
+    exit 1
+esac
 
 function wait_for_cook {
     COOK_PORT=${1:-12321}
@@ -21,7 +41,6 @@ export -f wait_for_cook
 
 export PROJECT_DIR=`pwd`
 
-CONFIG_FILE="scheduler_config.edn"
 COOK_EXECUTOR_COMMAND=""
 if [ "${COOK_EXECUTOR}" = "1" ]
 then

@@ -6,7 +6,7 @@
 
 set -ev
 
-NOSE_ATTRIBUTES=${1:-'!explicit'}
+PYTEST_MARKS=''
 
 function wait_for_cook {
     COOK_PORT=${1:-12321}
@@ -26,11 +26,10 @@ COOK_EXECUTOR_COMMAND=""
 if [ "${COOK_EXECUTOR}" = "1" ]
 then
   echo "$(date +%H:%M:%S) Cook executor has been enabled"
-  COOK_EXECUTOR_COMMAND="/home/travis/build/twosigma/Cook/travis/cook-executor/cook-executor"
+  COOK_EXECUTOR_COMMAND="${TRAVIS_BUILD_DIR}/travis/cook-executor-local/cook-executor-local"
+  # Build cook-executor
+  ${PROJECT_DIR}/../travis/build_cook_executor.sh
 fi
-
-# Build cook-executor
-${PROJECT_DIR}/../travis/build_cook_executor.sh
 
 # Start minimesos
 cd ${PROJECT_DIR}/../travis
@@ -78,15 +77,16 @@ fi
 
 # Install the CLI
 cd ${PROJECT_DIR}/../cli
-python3 --version
-python3 setup.py install
+python --version
+pip install -e .
 CLI=$(pyenv which cs)
 export PATH=${PATH}:$(dirname ${CLI})
 cs --help
 
 # Run the integration tests
 cd ${PROJECT_DIR}
-COOK_MULTI_CLUSTER= COOK_MASTER_SLAVE= COOK_SLAVE_URL=http://localhost:12322 python3 setup.py nosetests --attr ${NOSE_ATTRIBUTES} --verbosity=3 || test_failures=true
+COOK_MULTI_CLUSTER= COOK_MASTER_SLAVE= COOK_SLAVE_URL=http://localhost:12322 \
+  pytest --timeout-method=thread --boxed -v -m "${PYTEST_MARKS}" || test_failures=true
 
 # If there were failures, dump the executor logs
 if [ "$test_failures" = true ]; then

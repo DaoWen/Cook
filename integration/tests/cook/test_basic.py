@@ -1209,7 +1209,8 @@ class CookTest(unittest.TestCase):
             job_details = f'Job details: {json.dumps(job, sort_keys=True)}'
             self.assertIn(job['status'], statuses, job_details)
             self.assertEqual(job['retries_remaining'], 0, job_details)
-            self.assertEqual(len(job['instances']), 2, job_details)
+            instances = [ i for i in job['instances'] if i['reason_code'] == reasons.CMD_NON_ZERO_EXIT ]
+            self.assertEqual(len(instances), 2, job_details)
 
     def test_400_on_group_query_without_uuid(self):
         resp = util.query_groups(self.cook_url)

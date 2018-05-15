@@ -15,7 +15,7 @@ else
     cp -f /var/cache/apt/archives/*.deb $PACKAGE_CACHE_DIR/
 fi
 
-dpkg --force-all --install /var/cache/apt/archives/mesos_*.deb && apt-get install -fy
+dpkg --force-all --install /var/cache/apt/archives/*.deb && apt-get install --no-download --yes --fix-broken
 APT_EXIT_CODE=$?
 
 if [ $APT_EXIT_CODE -ne 0 ]; then

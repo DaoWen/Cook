@@ -20,9 +20,12 @@
             [clojure.core.async :as async]
             [clojure.core.cache :as cache]
             [clojure.tools.logging :as log]
+            [cook.impersonation :refer (create-impersonation-middleware)]
             [cook.mesos.api :as api]
             [cook.mesos.schema :as schema]
+            [cook.mesos.util :as util]
             [datomic.api :as d :refer (q db)]
+            [mount.core :as mount]
             [plumbing.core :refer [mapply]]
             [qbits.jet.server :refer (run-jetty)]
             [ring.middleware.params :refer (wrap-params)])
@@ -33,6 +36,7 @@
   "Runs a minimal cook scheduler server for testing inside a thread. Note that it is not properly kerberized."
   [conn port]
   (let [authorized-fn (fn [w x y z] true)
+        user (System/getProperty "user.name")
         api-handler (wrap-params
                       (api/main-handler conn
                                         "my-framework-id"
@@ -41,11 +45,12 @@
                                          :mesos-gpu-enabled false
                                          :task-constraints {:cpus 12 :memory-gb 100 :retry-limit 200}}
                                         (Object.)
-                                        (atom true)
-                                        (constantly nil)))
+                                        (atom true)))
+        ; Add impersonation handler (current user is authorized to impersonate)
+        api-handler-impersonation ((create-impersonation-middleware #{user}) api-handler)
         ; Mock kerberization, not testing that
         api-handler-kerb (fn [req]
-                           (api-handler (assoc req :authorization/user (System/getProperty "user.name"))))
+                           (api-handler-impersonation (assoc req :authorization/user user)))
         exit-chan (async/chan)]
     (async/thread
       (let [server (run-jetty {:port port :ring-handler api-handler-kerb :join? false})]
@@ -60,12 +65,21 @@
        (finally
          (async/close! exit-chan#)))))
 
+(defn flush-caches!
+  "Flush the caches. Needed in unit tests. We centralize initialization by using it to initialize the caches too."
+  []
+  (.invalidateAll util/job-ent->resources-cache)
+  (.invalidateAll util/categorize-job-cache)
+  (.invalidateAll util/task-ent->user-cache)
+  (.invalidateAll util/task->feature-vector-cache))
+
 (defn restore-fresh-database!
   "Completely delete all data, start a fresh database and apply transactions if
    provided.
 
    Return a connection to the fresh database."
   [uri & txn]
+  (flush-caches!)
   (d/delete-database uri)
   (d/create-database uri)
   (let [conn (d/connect uri)]
@@ -78,7 +92,8 @@
 (defn create-dummy-job
   "Return the entity id for the created dummy job."
   [conn & {:keys [command committed? container custom-executor? disable-mea-culpa-retries env executor gpus group
-                  job-state max-runtime memory name ncpus priority retry-count submit-time under-investigation user uuid]
+                  job-state max-runtime memory name ncpus pool priority retry-count submit-time under-investigation user
+                  uuid]
            :or {command "dummy command"
                 committed? true
                 disable-mea-culpa-retries false
@@ -120,7 +135,9 @@
                          :job/uuid uuid}
                         (when (not (nil? custom-executor?)) {:job/custom-executor custom-executor?})
                         (when executor {:job/executor executor})
-                        (when group {:group/_job group}))
+                        (when group {:group/_job group})
+                        (when pool
+                          {:job/pool (d/entid (d/db conn) [:pool/name pool])}))
         job-info (if gpus
                    (update-in job-info [:job/resource] conj {:resource/type :resource.type/gpus
                                                              :resource/amount (double gpus)})
@@ -234,3 +251,46 @@
                              {:level :info
                               :out (ConsoleAppender. (PatternLayout. "%d{ISO8601} %-5p %c [%t] - %m%n"))}))
   (log/info "Running" (:var m)))
+
+(let [minimal-config {:authorization {:one-user ""}
+                      :database {:datomic-uri ""}
+                      :log {}
+                      :mesos {:leader-path "", :master ""}
+                      :metrics {}
+                      :nrepl {}
+                      :port 80
+                      :scheduler {}
+                      :unhandled-exceptions {}
+                      :zookeeper {:local? true}}]
+  (defn setup
+    "Given an optional config map, initializes the config state"
+    [& {:keys [config], :or nil}]
+    (mount/stop)
+    (mount/start-with-args (merge minimal-config config) #'cook.config/config)))
+
+(defn wait-for
+  "Invoke predicate every interval (default 10) seconds until it returns true,
+   or timeout (default 150) seconds have elapsed. E.g.:
+       (wait-for #(< (rand) 0.2) :interval 1 :timeout 10)
+   Returns nil if the timeout elapses before the predicate becomes true, otherwise
+   the value of the predicate on its last evaluation."
+  [predicate & {:keys [interval timeout unit-multiplier]
+                :or {interval 10
+                     timeout 150
+                     unit-multiplier 1000}}]
+  (let [end-time (+ (System/currentTimeMillis) (* timeout unit-multiplier))]
+    (loop []
+      (if-let [result (predicate)]
+        result
+        (do
+          (Thread/sleep (* interval unit-multiplier))
+          (if (< (System/currentTimeMillis) end-time)
+            (recur)))))))
+
+(defn create-pool
+  "Creates an active pool with the given name for use in unit testing"
+  [conn name]
+  @(d/transact conn [{:db/id (d/tempid :db.part/user)
+                      :pool/name name
+                      :pool/purpose "This is a pool for unit testing"
+                      :pool/state :pool.state/active}]))

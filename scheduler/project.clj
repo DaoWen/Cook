@@ -13,14 +13,14 @@
 ;; See the License for the specific language governing permissions and
 ;; limitations under the License.
 ;;
-(defproject cook "1.9.1-SNAPSHOT"
+(defproject cook "1.16.1-SNAPSHOT"
   :description "This launches jobs on a Mesos cluster with fair sharing and preemption"
   :license {:name "Apache License, Version 2.0"}
   :dependencies [[org.clojure/clojure "1.8.0"]
 
                  ;;Data marshalling
                  [org.clojure/data.codec "0.1.0"]
-                 [cheshire "5.3.1"]
+                 ^:displace [cheshire "5.3.1"]
                  [byte-streams "0.1.4"]
                  [org.clojure/data.json "0.2.2"]
                  [com.taoensso/nippy "2.8.0"
@@ -30,6 +30,7 @@
                  [com.rpl/specter "1.0.1"]
 
                  ;;Utility
+                 [com.google.guava/guava "17.0"]
                  [amalloy/ring-buffer "1.1"]
                  [listora/ring-congestion "0.1.2"]
                  [lonocloud/synthread "1.0.4"]
@@ -45,11 +46,11 @@
                  [org.clojure/data.priority-map "0.0.5"]
                  [swiss-arrows "1.0.0"]
                  [riddley "0.1.10"]
-                 [com.netflix.fenzo/fenzo-core "0.10.0"
-                  :exclusions [org.apache.mesos/mesos
-                               com.fasterxml.jackson.core/jackson-core
-                               org.slf4j/slf4j-api
-                               org.slf4j/slf4j-simple]]
+                 ^:displace [com.netflix.fenzo/fenzo-core "0.10.0"
+                             :exclusions [org.apache.mesos/mesos
+                                          com.fasterxml.jackson.core/jackson-core
+                                          org.slf4j/slf4j-api
+                                          org.slf4j/slf4j-simple]]
 
                  ;;Logging
                  [org.clojure/tools.logging "0.2.6"]
@@ -85,11 +86,9 @@
                  [metrics-clojure-jvm "2.6.1"]
                  [io.dropwizard.metrics/metrics-graphite "3.1.2"]
                  [com.aphyr/metrics3-riemann-reporter "0.4.0"]
-                 [riemann-clojure-client "0.4.1"]
 
                  ;;External system integrations
                  [me.raynes/conch "0.5.2"]
-                 [wyegelwe/mesomatic "1.0.1-r0-SNAPSHOT"]
                  [org.clojure/tools.nrepl "0.2.3"]
 
                  ;;Ring
@@ -104,22 +103,16 @@
                  [liberator "0.15.0"]
 
                  ;;Databases
-                 [com.datomic/datomic-free "0.9.5206"
-                  :exclusions [org.slf4j/slf4j-api
-                               com.fasterxml.jackson.core/jackson-core
-                               org.slf4j/jcl-over-slf4j
-                               org.slf4j/jul-to-slf4j
-                               org.slf4j/log4j-over-slf4j
-                               org.slf4j/slf4j-nop
-                               joda-time]]
                  [org.apache.curator/curator-framework "2.7.1"
                   :exclusions [io.netty/netty]]
                  [org.apache.curator/curator-recipes "2.7.1"
                   :exclusions [org.slf4j/slf4j-log4j12
                                org.slf4j/log4j
-                               log4j
-                               ]]
-                 [org.apache.curator/curator-test "2.7.1"]]
+                               log4j]]
+                 [org.apache.curator/curator-test "2.7.1"]
+
+                 ;; Dependency management
+                 [mount "0.1.12"]]
 
   :repositories {"maven2" {:url "https://files.couchbase.com/maven2/"}
                  "sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
@@ -139,15 +132,44 @@
   :java-source-paths ["java"]
 
   :profiles
-  {:uberjar
-   {:aot [cook.components]}
+  {
+   ; By default, activate the :oss profile (explained below)
+   :default [:base :system :user :provided :dev :oss]
+
+   ; The :oss profile exists so that Cook can be built with a more
+   ; appropriate set of dependencies for a specific environment than
+   ; the ones defined here (by using `lein with-profile -oss` ...)
+   :oss
+   {:dependencies [
+                   ; For example, one could drop in the datomic-pro
+                   ; library instead of the datomic-free library, by
+                   ; using a profiles.clj file that defines a profile
+                   ; which pulls in datomic-pro
+                   [com.datomic/datomic-free "0.9.5206"
+                    :exclusions [com.fasterxml.jackson.core/jackson-core
+                                 joda-time
+                                 org.slf4j/jcl-over-slf4j
+                                 org.slf4j/jul-to-slf4j
+                                 org.slf4j/log4j-over-slf4j
+                                 org.slf4j/slf4j-api
+                                 org.slf4j/slf4j-nop]]
+                   ; Similarly, one could use an older version of the
+                   ; mesomatic library in environments that require it
+                   [wyegelwe/mesomatic "1.0.1-r0-SNAPSHOT"]]}
+
+   :uberjar
+   {:aot [cook.components]
+    :dependencies [[com.datomic/datomic-free "0.9.5206"
+                    :exclusions [com.fasterxml.jackson.core/jackson-core
+                                 joda-time
+                                 org.slf4j/jcl-over-slf4j
+                                 org.slf4j/jul-to-slf4j
+                                 org.slf4j/log4j-over-slf4j
+                                 org.slf4j/slf4j-api
+                                 org.slf4j/slf4j-nop]]]}
 
    :dev
-   {:dependencies [[clj-http-fake "1.0.1"]
-                   [criterium "0.4.4"]
-                   [org.mockito/mockito-core "1.10.19"]
-                   [twosigma/cook-jobclient "0.1.2-SNAPSHOT"]
-                   [org.clojure/test.check "0.6.1"]
+   {:dependencies [[criterium "0.4.4"]
                    [log4j/log4j "1.2.17" :exclusions [javax.mail/mail
                                                       javax.jms/jms
                                                       com.sun.jdmk/jmxtools
@@ -161,15 +183,22 @@
     :resource-paths ["test-resources"]
     :source-paths []}
 
+   :test
+   {:dependencies [[criterium "0.4.4"]
+                   [org.clojure/test.check "0.6.1"]
+                   [org.mockito/mockito-core "1.10.19"]
+                   [twosigma/cook-jobclient "0.2.0-SNAPSHOT"]]}
+
    :test-console
-   {:jvm-opts ["-Dcook.test.logging.console"]}
+   [:test {:jvm-opts ["-Dcook.test.logging.console"]}]
 
    :docker
    ; avoid calling javac in docker
    ; (.java sources are only used for unit test support)
    {:java-source-paths ^:replace []}}
 
-  :plugins [[lein-print "0.1.0"]]
+  :plugins [[lein-exec "0.3.7"]
+            [lein-print "0.1.0"]]
 
   :test-selectors {:all (constantly true)
                    :all-but-benchmark (complement :benchmark)
@@ -190,5 +219,4 @@
              "-XX:NumberOfGCLogFiles=20"
              "-XX:GCLogFileSize=128M"
              "-XX:+PrintGCDateStamps"
-             "-XX:+HeapDumpOnOutOfMemoryError"
-             ])
+             "-XX:+HeapDumpOnOutOfMemoryError"])

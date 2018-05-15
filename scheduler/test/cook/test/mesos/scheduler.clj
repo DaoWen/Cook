@@ -22,19 +22,23 @@
             [clojure.core.cache :as cache]
             [clojure.data.json :as json]
             [clojure.string :as str]
+            [clojure.tools.logging :as log]
             [clojure.walk :as walk]
             [cook.mesos.heartbeat :as heartbeat]
             [cook.mesos.sandbox :as sandbox]
             [cook.mesos.scheduler :as sched]
             [cook.mesos.share :as share]
             [cook.mesos.util :as util]
-            [cook.test.testutil :refer (restore-fresh-database! create-dummy-group create-dummy-job create-dummy-instance init-offer-cache poll-until)]
+            [cook.test.testutil :refer [restore-fresh-database! create-dummy-group create-dummy-job
+                                        create-dummy-instance init-offer-cache poll-until wait-for]]
             [criterium.core :as crit]
             [datomic.api :as d :refer (q db)]
             [mesomatic.scheduler :as msched]
             [mesomatic.types :as mtypes]
             [plumbing.core :as pc])
-  (:import (com.netflix.fenzo TaskAssignmentResult TaskScheduler VMTaskFitnessCalculator)
+  (:import (clojure.lang ExceptionInfo)
+           (com.netflix.fenzo SimpleAssignmentResult TaskAssignmentResult
+                              TaskRequest TaskScheduler VMTaskFitnessCalculator)
            (com.netflix.fenzo.plugins BinPackingFitnessCalculators)
            (java.util UUID)
            (java.util.concurrent CountDownLatch TimeUnit)
@@ -178,15 +182,15 @@
         _ (create-dummy-instance conn j7)]
 
     (testing "sort-jobs-by-dru default share for everyone"
-      (let [_ (share/set-share! conn "default"
+      (let [_ (share/set-share! conn "default" nil
                                 "limits for new cluster"
                                 :mem 10.0 :cpus 10.0)
             db (d/db conn)]
         (is (= [j2 j3 j6 j4 j8] (map :db/id (:normal (sched/sort-jobs-by-dru-category db)))))))
 
     (testing "sort-jobs-by-dru one user has non-default share"
-      (let [_ (share/set-share! conn "default" "limits for new cluster" :mem 10.0 :cpus 10.0)
-            _ (share/set-share! conn "sunil" "needs more resources" :mem 100.0 :cpus 100.0)
+      (let [_ (share/set-share! conn "default" nil "limits for new cluster" :mem 10.0 :cpus 10.0)
+            _ (share/set-share! conn "sunil" nil "needs more resources" :mem 100.0 :cpus 100.0)
             db (d/db conn)]
         (is (= [j8 j2 j3 j6 j4] (map :db/id (:normal (sched/sort-jobs-by-dru-category db))))))))
 
@@ -319,6 +323,7 @@
   (def t2-1 (d/resolve-tempid db-after tempids t2-1)))
 
 (deftest test-extract-job-resources
+  (cook.test.testutil/flush-caches!)
   (let [resources (util/job-ent->resources (d/entity (db c) j1))]
     (is (= 1.0 (:cpus resources)))
     (is (= 1000.0 (:mem resources)))))
@@ -334,7 +339,7 @@
         framework-id (str "framework-id-" (UUID/randomUUID))
         fenzo-maker #(sched/make-fenzo-scheduler nil 100000 nil 1)] ; The params are for offer declining, which should never happen
     (testing "Consume no schedule cases"
-      (are [schedule offers] (= [] (:matches (sched/match-offer-to-schedule (db c) (fenzo-maker) schedule offers)))
+      (are [schedule offers] (= [] (:matches (sched/match-offer-to-schedule (db c) (fenzo-maker) schedule offers (atom {}))))
                              [] (offer-maker 0 0)
                              [] (offer-maker 2 2000)
                              schedule (offer-maker 0 0)
@@ -345,7 +350,7 @@
       ;; We're looking for one task to get assigned
       (are [offers] (= 1 (count (mapcat :tasks
                                         (:matches (sched/match-offer-to-schedule
-                                                    (db c) (fenzo-maker) schedule offers)))))
+                                                    (db c) (fenzo-maker) schedule offers (atom {}))))))
                     (offer-maker 1 1000)
                     (offer-maker 1.5 1500)))
     (testing "Consume full schedule cases"
@@ -353,7 +358,7 @@
       (are [offers] (= (count schedule)
                        (count (mapcat :tasks
                                       (:matches (sched/match-offer-to-schedule
-                                                  (db c) (fenzo-maker) schedule offers)))))
+                                                  (db c) (fenzo-maker) schedule offers (atom {}))))))
                     (offer-maker 4 4000)
                     (offer-maker 5 5000)))))
 
@@ -392,7 +397,7 @@
         high-priority (map #(d/entity (d/db conn) %) high-priority-ids)
         considerable (concat high-priority low-priority)]
     (testing "Scheduling order respected?"
-      (let [schedule (sched/match-offer-to-schedule (d/db conn) fenzo considerable [(offer-maker 1.0 "empty_host")])]
+      (let [schedule (sched/match-offer-to-schedule (d/db conn) fenzo considerable [(offer-maker 1.0 "empty_host")] (atom {}))]
         (is (= {"empty_host" ["high-priority"]}
                (->> schedule
                     :matches
@@ -402,7 +407,6 @@
                     (map (partial apply hash-map))
                     (cons concat)
                     (apply merge-with))))))))
-
 
 (deftest test-get-user->used-resources
   (let [uri "datomic:mem://test-get-used-resources"
@@ -844,17 +848,17 @@
         ; Update ljin-1 to running
         inst (create-dummy-instance conn ljin-1 :instance-status :instance.status/unknown)
         _ @(d/transact conn [[:instance/update-state inst :instance.status/running [:reason/name :unknown]]])
-        _ (share/set-share! conn "default"
+        _ (share/set-share! conn "default" nil
                             "limits for new cluster"
                             :cpus 1.0 :mem 2.0 :gpus 1.0)]
     (testing "one user has double gpu share"
-      (let [_ (share/set-share! conn "ljin"
+      (let [_ (share/set-share! conn "ljin" nil
                                 "Needs some GPUs"
                                 :gpus 2.0)
             db (d/db conn)]
         (is (= [ljin-2 wzhao-1 ljin-3 ljin-4 wzhao-2] (map :db/id (:gpu (sched/sort-jobs-by-dru-category db)))))))
     (testing "one user has single gpu share"
-      (let [_ (share/set-share! conn "ljin"
+      (let [_ (share/set-share! conn "ljin" nil
                                 "Doesn't need lots of gpus"
                                 :gpus 1.0)
             db (d/db conn)]
@@ -892,7 +896,10 @@
                                    (let [task {:task-id {:value task-id}
                                                :reason reason
                                                :state state}]
-                                     task))]
+                                     task))
+        synced-agents-atom (atom [])
+        sync-agent-sandboxes-fn (fn sync-agent-sandboxes-fn [hostname _]
+                                  (swap! synced-agents-atom conj hostname))]
 
     (testing "Mesos task death"
       (let [job-id (create-dummy-job conn :user "tsram" :job-state :job.state/running)
@@ -902,7 +909,7 @@
                                                :task-id task-id)]
         ; Wait for async database transaction inside handle-status-update
         (->> (make-dummy-status-update task-id :reason-gc-error :task-killed)
-             (sched/handle-status-update conn driver fenzo)
+             (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
              async/<!!)
 
         (is (= :instance.status/failed
@@ -927,7 +934,7 @@
               original-end-time (get-end-time)]
           (Thread/sleep 100)
           (->> (make-dummy-status-update task-id :reason-gc-error :task-killed)
-               (sched/handle-status-update conn driver fenzo)
+               (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
                async/<!!)
           (is (= original-end-time (get-end-time))))))
 
@@ -952,7 +959,7 @@
                                                :reason :max-runtime-exceeded)] ; Previous reason is not mea-culpa
         ; Status update says slave got restarted (mea-culpa)
         (->> (make-dummy-status-update task-id :mesos-slave-restarted :task-killed)
-             (sched/handle-status-update conn driver fenzo)
+             (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
              async/<!!)
         ; Assert old reason persists
         (is (= :max-runtime-exceeded
@@ -987,10 +994,12 @@
                                :instance-status :instance.status/success
                                :task-id task-id-b
                                :reason :unknown)
+        (reset! synced-agents-atom [])
         (->> (make-dummy-status-update task-id-a :mesos-slave-restarted :task-running)
-             (sched/handle-status-update conn driver fenzo)
+             (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
              async/<!!)
-        (is (true? (contains? @tasks-killed task-id-a)))))
+        (is (true? (contains? @tasks-killed task-id-a)))
+        (is (= ["www.test-host.com"] @synced-agents-atom))))
 
     (testing "instance persists mesos-start-time when task is first known to be starting or running"
       (let [job-id (create-dummy-job conn
@@ -1009,17 +1018,19 @@
                                :task-id task-id)
         (is (nil? (mesos-start-time)))
         (->> (make-dummy-status-update task-id :unknown :task-staging)
-             (sched/handle-status-update conn driver fenzo)
+             (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
              async/<!!)
         (is (nil? (mesos-start-time)))
+        (reset! synced-agents-atom [])
         (->> (make-dummy-status-update task-id :unknown :task-running)
-             (sched/handle-status-update conn driver fenzo)
+             (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
              async/<!!)
+        (is (= ["www.test-host.com"] @synced-agents-atom))
         (is (not (nil? (mesos-start-time))))
         (let [first-observed-start-time (.getTime (mesos-start-time))]
           (is (not (nil? first-observed-start-time)))
           (->> (make-dummy-status-update task-id :unknown :task-running)
-               (sched/handle-status-update conn driver fenzo)
+               (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
                async/<!!)
           (is (= first-observed-start-time (.getTime (mesos-start-time)))))))))
 
@@ -1466,7 +1477,10 @@
         offer-6 (offer-maker 10 4096 10)
         offer-7 (offer-maker 20 4096 5)
         offer-8 (offer-maker 30 16384 1)
-        run-handle-resource-offers! (fn [num-considerable offers & {:keys [user-quota user->usage]}]
+        offer-9 (offer-maker 100 200000 0)
+        run-handle-resource-offers! (fn [num-considerable offers & {:keys [user-quota user->usage rebalancer-reservation-atom job-name->uuid]
+                                                                    :or {rebalancer-reservation-atom (atom {})
+                                                                         job-name->uuid {}}}]
                                       (reset! launched-offer-ids-atom [])
                                       (reset! launched-job-ids-atom [])
                                       (let [conn (restore-fresh-database! uri)
@@ -1474,12 +1488,45 @@
                                             driver-atom (atom nil)
                                             ^TaskScheduler fenzo (sched/make-fenzo-scheduler driver-atom 1500 nil 0.8)
                                             group-ent-id (create-dummy-group conn)
-                                            job-1 (d/entity test-db (create-dummy-job conn :group group-ent-id :name "job-1" :ncpus 3 :memory 2048))
-                                            job-2 (d/entity test-db (create-dummy-job conn :group group-ent-id :name "job-2" :ncpus 13 :memory 1024))
-                                            job-3 (d/entity test-db (create-dummy-job conn :group group-ent-id :name "job-3" :ncpus 7 :memory 4096))
-                                            job-4 (d/entity test-db (create-dummy-job conn :group group-ent-id :name "job-4" :ncpus 11 :memory 1024))
-                                            job-5 (d/entity test-db (create-dummy-job conn :group group-ent-id :name "job-5" :ncpus 5 :memory 2048 :gpus 2))
-                                            job-6 (d/entity test-db (create-dummy-job conn :group group-ent-id :name "job-6" :ncpus 19 :memory 1024 :gpus 4))
+                                            get-uuid (fn [name] (get job-name->uuid name (d/squuid)))
+                                            job-1 (d/entity test-db (create-dummy-job conn
+                                                                                      :uuid (get-uuid "job-1")
+                                                                                      :group group-ent-id
+                                                                                      :name "job-1"
+                                                                                      :ncpus 3
+                                                                                      :memory 2048))
+                                            job-2 (d/entity test-db (create-dummy-job conn
+                                                                                      :uuid (get-uuid "job-2")
+                                                                                      :group group-ent-id
+                                                                                      :name "job-2"
+                                                                                      :ncpus 13
+                                                                                      :memory 1024))
+                                            job-3 (d/entity test-db (create-dummy-job conn
+                                                                                      :uuid (get-uuid "job-3")
+                                                                                      :group group-ent-id
+                                                                                      :name "job-3"
+                                                                                      :ncpus 7
+                                                                                      :memory 4096))
+                                            job-4 (d/entity test-db (create-dummy-job conn
+                                                                                      :uuid (get-uuid "job-4")
+                                                                                      :group group-ent-id
+                                                                                      :name "job-4"
+                                                                                      :ncpus 11
+                                                                                      :memory 1024))
+                                            job-5 (d/entity test-db (create-dummy-job conn
+                                                                                      :uuid (get-uuid "job-5")
+                                                                                      :group group-ent-id
+                                                                                      :name "job-5"
+                                                                                      :ncpus 5
+                                                                                      :memory 2048
+                                                                                      :gpus 2))
+                                            job-6 (d/entity test-db (create-dummy-job conn
+                                                                                      :uuid (get-uuid "job-6")
+                                                                                      :group group-ent-id
+                                                                                      :name "job-6"
+                                                                                      :ncpus 19
+                                                                                      :memory 1024
+                                                                                      :gpus 4))
                                             entity->map (fn [entity]
                                                           (util/job-ent->map entity (d/db conn)))
                                             category->pending-jobs (->> {:normal [job-1 job-2 job-3 job-4] :gpu [job-5 job-6]}
@@ -1487,136 +1534,165 @@
                                             category->pending-jobs-atom (atom category->pending-jobs)
                                             user->usage (or user->usage {test-user {:count 1, :cpus 2, :mem 1024, :gpus 0}})
                                             user->quota (or user-quota {test-user {:count 10, :cpus 50, :mem 32768, :gpus 10}})
-                                            result (sched/handle-resource-offers! conn driver fenzo framework-id executor category->pending-jobs-atom (init-offer-cache)
-                                                                                  user->usage user->quota num-considerable offers-chan offers)]
+                                            mesos-run-as-user nil
+                                            result (sched/handle-resource-offers!
+                                                     conn driver fenzo framework-id category->pending-jobs-atom mesos-run-as-user
+                                                     user->usage user->quota num-considerable offers-chan offers rebalancer-reservation-atom)]
                                         (async/>!! offers-chan :end-marker)
                                         result))]
+    (with-redefs [cook.config/executor-config (constantly executor)]
+      (testing "enough offers for all normal jobs"
+        (let [num-considerable 10
+              offers [offer-1 offer-2 offer-3]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 3 (count @launched-offer-ids-atom)))
+          (is (= 4 (count @launched-job-ids-atom)))
+          (is (= #{"job-1" "job-2" "job-3" "job-4"} (set @launched-job-ids-atom)))))
 
-    (testing "enough offers for all normal jobs"
-      (let [num-considerable 10
-            offers [offer-1 offer-2 offer-3]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 3 (count @launched-offer-ids-atom)))
-        (is (= 4 (count @launched-job-ids-atom)))
-        (is (= #{"job-1" "job-2" "job-3" "job-4"} (set @launched-job-ids-atom)))))
+      (testing "enough offers for all normal jobs, limited by num-considerable of 1"
+        (let [num-considerable 1
+              offers [offer-1 offer-2 offer-3]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 1 (count @launched-offer-ids-atom)))
+          (is (= 1 (count @launched-job-ids-atom)))
+          (is (= #{"job-1"} (set @launched-job-ids-atom)))))
 
-    (testing "enough offers for all normal jobs, limited by num-considerable of 1"
-      (let [num-considerable 1
-            offers [offer-1 offer-2 offer-3]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 1 (count @launched-offer-ids-atom)))
-        (is (= 1 (count @launched-job-ids-atom)))
-        (is (= #{"job-1"} (set @launched-job-ids-atom)))))
+      (testing "enough offers for all normal jobs, limited by num-considerable of 2"
+        (let [num-considerable 2
+              offers [offer-1 offer-2 offer-3]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 2 (count @launched-offer-ids-atom)))
+          (is (= 2 (count @launched-job-ids-atom)))
+          (is (= #{"job-1" "job-2"} (set @launched-job-ids-atom)))))
 
-    (testing "enough offers for all normal jobs, limited by num-considerable of 2"
-      (let [num-considerable 2
-            offers [offer-1 offer-2 offer-3]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 2 (count @launched-offer-ids-atom)))
-        (is (= 2 (count @launched-job-ids-atom)))
-        (is (= #{"job-1" "job-2"} (set @launched-job-ids-atom)))))
+      (testing "enough offers for all normal jobs, limited by quota"
+        (let [num-considerable 1
+              offers [offer-1 offer-2 offer-3]
+              user-quota {test-user {:count 5, :cpus 45, :mem 16384, :gpus 0}}]
+          (is (run-handle-resource-offers! num-considerable offers :user-quota user-quota))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 1 (count @launched-offer-ids-atom)))
+          (is (= 1 (count @launched-job-ids-atom)))
+          (is (= #{"job-1"} (set @launched-job-ids-atom)))))
 
-    (testing "enough offers for all normal jobs, limited by quota"
-      (let [num-considerable 1
-            offers [offer-1 offer-2 offer-3]
-            user-quota {test-user {:count 5, :cpus 45, :mem 16384, :gpus 0}}]
-        (is (run-handle-resource-offers! num-considerable offers :user-quota user-quota))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 1 (count @launched-offer-ids-atom)))
-        (is (= 1 (count @launched-job-ids-atom)))
-        (is (= #{"job-1"} (set @launched-job-ids-atom)))))
+      (testing "enough offers for all normal jobs, limited by usage capacity"
+        (let [num-considerable 1
+              offers [offer-1 offer-2 offer-3]
+              user->usage {test-user {:count 5, :cpus 5, :mem 16384, :gpus 0}}]
+          (is (run-handle-resource-offers! num-considerable offers :user->usage user->usage))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 1 (count @launched-offer-ids-atom)))
+          (is (= 1 (count @launched-job-ids-atom)))
+          (is (= #{"job-1"} (set @launched-job-ids-atom)))))
 
-    (testing "enough offers for all normal jobs, limited by usage capacity"
-      (let [num-considerable 1
-            offers [offer-1 offer-2 offer-3]
-            user->usage {test-user {:count 5, :cpus 5, :mem 16384, :gpus 0}}]
-        (is (run-handle-resource-offers! num-considerable offers :user->usage user->usage))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 1 (count @launched-offer-ids-atom)))
-        (is (= 1 (count @launched-job-ids-atom)))
-        (is (= #{"job-1"} (set @launched-job-ids-atom)))))
+      (testing "offer for single normal job"
+        (let [num-considerable 10
+              offers [offer-4]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 1 (count @launched-offer-ids-atom)))
+          (is (= 1 (count @launched-job-ids-atom)))
+          (is (= #{"job-1"} (set @launched-job-ids-atom)))))
 
-    (testing "offer for single normal job"
-      (let [num-considerable 10
-            offers [offer-4]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 1 (count @launched-offer-ids-atom)))
-        (is (= 1 (count @launched-job-ids-atom)))
-        (is (= #{"job-1"} (set @launched-job-ids-atom)))))
+      (testing "offer for first three normal jobs"
+        (let [num-considerable 10
+              offers [offer-3]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 1 (count @launched-offer-ids-atom)))
+          (is (= 3 (count @launched-job-ids-atom)))
+          (is (= #{"job-1" "job-2" "job-3"} (set @launched-job-ids-atom)))))
 
-    (testing "offer for first three normal jobs"
-      (let [num-considerable 10
-            offers [offer-3]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 1 (count @launched-offer-ids-atom)))
-        (is (= 3 (count @launched-job-ids-atom)))
-        (is (= #{"job-1" "job-2" "job-3"} (set @launched-job-ids-atom)))))
+      (testing "offer not fit for any normal job"
+        (let [num-considerable 10
+              offers [offer-5]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (zero? (count @launched-offer-ids-atom)))
+          (is (empty? @launched-job-ids-atom))))
 
-    (testing "offer not fit for any normal job"
-      (let [num-considerable 10
-            offers [offer-5]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (zero? (count @launched-offer-ids-atom)))
-        (is (empty? @launched-job-ids-atom))))
+      (testing "offer fit but user has too little quota"
+        (let [num-considerable 10
+              offers [offer-1 offer-2 offer-3]
+              user-quota {test-user {:count 5, :cpus 4, :mem 4096, :gpus 0}}]
+          (is (run-handle-resource-offers! num-considerable offers :user-quota user-quota))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (zero? (count @launched-offer-ids-atom)))
+          (is (empty? @launched-job-ids-atom))))
 
-    (testing "offer fit but user has too little quota"
-      (let [num-considerable 10
-            offers [offer-1 offer-2 offer-3]
-            user-quota {test-user {:count 5, :cpus 4, :mem 4096, :gpus 0}}]
-        (is (run-handle-resource-offers! num-considerable offers :user-quota user-quota))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (zero? (count @launched-offer-ids-atom)))
-        (is (empty? @launched-job-ids-atom))))
+      (testing "offer fit but user has capacity usage"
+        (let [num-considerable 10
+              offers [offer-1 offer-2 offer-3]
+              user->usage {test-user {:count 10, :cpus 50, :mem 32768, :gpus 10}}]
+          (is (run-handle-resource-offers! num-considerable offers :user->usage user->usage))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (zero? (count @launched-offer-ids-atom)))
+          (is (empty? @launched-job-ids-atom))))
 
-    (testing "offer fit but user has capacity usage"
-      (let [num-considerable 10
-            offers [offer-1 offer-2 offer-3]
-            user->usage {test-user {:count 10, :cpus 50, :mem 32768, :gpus 10}}]
-        (is (run-handle-resource-offers! num-considerable offers :user->usage user->usage))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (zero? (count @launched-offer-ids-atom)))
-        (is (empty? @launched-job-ids-atom))))
+      (testing "gpu offers for all gpu jobs"
+        (let [num-considerable 10
+              offers [offer-6 offer-7]]
+          (is (not (run-handle-resource-offers! num-considerable offers))) ; normal jobs form the head
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 2 (count @launched-offer-ids-atom)))
+          (is (= 2 (count @launched-job-ids-atom)))
+          (is (= #{"job-5" "job-6"} (set @launched-job-ids-atom)))))
 
-    (testing "gpu offers for all gpu jobs"
-      (let [num-considerable 10
-            offers [offer-6 offer-7]]
-        (is (not (run-handle-resource-offers! num-considerable offers))) ; normal jobs form the head
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 2 (count @launched-offer-ids-atom)))
-        (is (= 2 (count @launched-job-ids-atom)))
-        (is (= #{"job-5" "job-6"} (set @launched-job-ids-atom)))))
+      (testing "gpu offer for single gpu job"
+        (let [num-considerable 10
+              offers [offer-6]]
+          (is (not (run-handle-resource-offers! num-considerable offers))) ; normal jobs form the head
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 1 (count @launched-offer-ids-atom)))
+          (is (= 1 (count @launched-job-ids-atom)))
+          (is (= #{"job-5"} (set @launched-job-ids-atom)))))
 
-    (testing "gpu offer for single gpu job"
-      (let [num-considerable 10
-            offers [offer-6]]
-        (is (not (run-handle-resource-offers! num-considerable offers))) ; normal jobs form the head
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 1 (count @launched-offer-ids-atom)))
-        (is (= 1 (count @launched-job-ids-atom)))
-        (is (= #{"job-5"} (set @launched-job-ids-atom)))))
+      (testing "gpu offer matching no gpu job"
+        (let [num-considerable 10
+              offers [offer-8]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (zero? (count @launched-offer-ids-atom)))
+          (is (empty? @launched-job-ids-atom))))
 
-    (testing "gpu offer matching no gpu job"
-      (let [num-considerable 10
-            offers [offer-8]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (zero? (count @launched-offer-ids-atom)))
-        (is (empty? @launched-job-ids-atom))))
+      (testing "offer for single normal and single gpu job"
+        (let [num-considerable 10
+              offers [offer-4 offer-6]]
+          (is (run-handle-resource-offers! num-considerable offers))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 2 (count @launched-offer-ids-atom)))
+          (is (= 2 (count @launched-job-ids-atom)))
+          (is (= #{"job-1" "job-5"} (set @launched-job-ids-atom)))))
 
-    (testing "offer for single normal and single gpu job"
-      (let [num-considerable 10
-            offers [offer-4 offer-6]]
-        (is (run-handle-resource-offers! num-considerable offers))
-        (is (= :end-marker (async/<!! offers-chan)))
-        (is (= 2 (count @launched-offer-ids-atom)))
-        (is (= 2 (count @launched-job-ids-atom)))
-        (is (= #{"job-1" "job-5"} (set @launched-job-ids-atom)))))))
+      (testing "will not launch jobs on reserved host"
+        (let [num-considerable 10
+              offers [offer-1]
+              initial-reservation-state {:job-uuid->reserved-host {(UUID/randomUUID) (:hostname offer-1)}}
+              rebalancer-reservation-atom (atom initial-reservation-state)]
+          (is (run-handle-resource-offers! num-considerable offers :rebalancer-reservation-atom rebalancer-reservation-atom))
+          (is (= 0 (count @launched-job-ids-atom)))
+          (is (= initial-reservation-state @rebalancer-reservation-atom))))
+
+      (testing "only launches reserved jobs on reserved host"
+        (let [num-considerable 10
+              offers [offer-9] ; large enough to launch jobs 1, 2, 3, and 4
+              job-1-uuid (d/squuid)
+              job-2-uuid (d/squuid)
+              initial-reservation-state {:job-uuid->reserved-host {job-1-uuid (:hostname offer-9)
+                                                                   job-2-uuid (:hostname offer-9)}}
+              rebalancer-reservation-atom (atom initial-reservation-state)]
+          (is (run-handle-resource-offers! num-considerable offers :rebalancer-reservation-atom rebalancer-reservation-atom
+                                           :job-name->uuid {"job-1" job-1-uuid "job-2" job-2-uuid}))
+          (is (= :end-marker (async/<!! offers-chan)))
+          (is (= 2 (count @launched-job-ids-atom)))
+          (is (= #{"job-1" "job-2"} (set @launched-job-ids-atom)))
+          (is (= {:job-uuid->reserved-host {}
+                  :launched-job-uuids #{job-1-uuid job-2-uuid}}
+                 @rebalancer-reservation-atom)))))))
+
 
 (def dummy-fitness-calculator
   "This calculator simply returns 0.0 for every Fenzo fitness calculation."
@@ -1633,7 +1709,7 @@
   (testing "java class on classpath"
     (is (instance? VMTaskFitnessCalculator
                    (sched/config-string->fitness-calculator
-                     cook.components/default-fitness-calculator))))
+                     cook.config/default-fitness-calculator))))
 
   (testing "bad input"
     (is (thrown? IllegalArgumentException (sched/config-string->fitness-calculator "not-a-valid-anything"))))
@@ -1646,7 +1722,7 @@
   (let [status-store (atom {})
         latch (CountDownLatch. 11)]
     (with-redefs [sched/handle-status-update
-                  (fn [_ _ _ status]
+                  (fn [_ _ _ _ status]
                     (let [task-id (-> status :task-id :value str)]
                       (swap! status-store update task-id
                              (fn [statuses] (conj (or statuses [])
@@ -2001,5 +2077,148 @@
         (cancel-handle)
         (async/close! progress-state-chan)))))
 
-(comment
-  (run-tests))
+(defn- task-id->instance-entity
+  [db-conn task-id]
+  (let [datomic-db (d/db db-conn)]
+    (->> task-id
+         (d/q '[:find ?i
+                :in $ ?task-id
+                :where [?i :instance/task-id ?task-id]]
+              datomic-db)
+         ffirst
+         (d/entity (d/db db-conn))
+         d/touch)))
+
+(deftest test-sandbox-directory-population-for-mesos-executor-tasks
+  (let [db-conn (restore-fresh-database! "datomic:mem://test-sandbox-directory-population")
+        executing-tasks-atom (atom #{})
+        num-jobs 25
+        cache-timeout-ms 65
+        get-task-id #(str "task-test-sandbox-directory-population-" %)]
+    (dotimes [n num-jobs]
+      (let [task-id (get-task-id n)
+            job (create-dummy-job db-conn :task-id task-id)]
+        (create-dummy-instance db-conn job :executor :executor/mesos :executor-id task-id :task-id task-id)))
+
+    (with-redefs [sandbox/retrieve-sandbox-directories-on-agent
+                  (fn [_ _]
+                    (pc/map-from-keys #(str "/sandbox/for/" %) @executing-tasks-atom))]
+      (let [framework-id "test-framework-id"
+            publish-batch-size 10
+            publish-interval-ms 20
+            sync-interval-ms 20
+            max-consecutive-sync-failure 5
+            agent-query-cache (-> {} (cache/ttl-cache-factory :ttl cache-timeout-ms) atom)
+            {:keys [pending-sync-agent publisher-cancel-fn syncer-cancel-fn task-id->sandbox-agent] :as sandbox-syncer-state}
+            (sandbox/prepare-sandbox-publisher
+              framework-id db-conn publish-batch-size publish-interval-ms sync-interval-ms max-consecutive-sync-failure
+              agent-query-cache)
+            sync-agent-sandboxes-fn
+            (fn [hostname task-id]
+              (sandbox/sync-agent-sandboxes sandbox-syncer-state framework-id hostname task-id))]
+        (try
+          (-> (dotimes [n num-jobs]
+                (let [task-id (get-task-id n)]
+                  (swap! executing-tasks-atom conj task-id)
+                  (->> {:task-id {:value task-id}, :state :task-running}
+                       (sched/handle-status-update db-conn nil nil sync-agent-sandboxes-fn)))
+                (Thread/sleep 5))
+              async/thread
+              async/<!!)
+
+          (dotimes [n num-jobs]
+            (let [task-id (get-task-id n)
+                  instance-ent (task-id->instance-entity db-conn task-id)]
+              (is (= "localhost" (:instance/hostname instance-ent)))
+              (is (= :instance.status/running (:instance/status instance-ent)))
+              (is (= :executor/mesos (:instance/executor instance-ent)))))
+
+          (Thread/sleep (+ cache-timeout-ms sync-interval-ms))
+          (await pending-sync-agent)
+          (Thread/sleep (* 2 publish-interval-ms))
+          (await task-id->sandbox-agent)
+
+          ;; verify the sandbox-directory stored into the db
+          (dotimes [n num-jobs]
+            (let [task-id (get-task-id n)
+                  instance-ent (task-id->instance-entity db-conn task-id)]
+              (is (= (str "/sandbox/for/" task-id) (:instance/sandbox-directory instance-ent)))))
+
+          (finally
+            (publisher-cancel-fn)
+            (syncer-cancel-fn)))))))
+
+(deftest test-no-sandbox-directory-population-for-cook-executor-tasks
+  (let [db-conn (restore-fresh-database! "datomic:mem://test-sandbox-directory-population")
+        executing-tasks-atom (atom #{})
+        num-jobs 25
+        get-task-id #(str "task-test-sandbox-directory-population-" %)
+        sync-agent-sandboxes-fn (fn [_] (throw (Exception. "Unexpected call for cook executor task")))]
+    (dotimes [n num-jobs]
+      (let [task-id (get-task-id n)
+            job (create-dummy-job db-conn :task-id task-id)]
+        (create-dummy-instance db-conn job :executor :executor/cook :executor-id task-id :task-id task-id)))
+
+    (try
+      (-> (dotimes [n num-jobs]
+            (let [task-id (get-task-id n)]
+              (swap! executing-tasks-atom conj task-id)
+              (->> {:task-id {:value task-id}, :state :task-running}
+                   (sched/handle-status-update db-conn nil nil sync-agent-sandboxes-fn)))
+            (Thread/sleep 5))
+          async/thread
+          async/<!!)
+
+      ;; verify the instance state
+      (dotimes [n num-jobs]
+        (let [task-id (get-task-id n)
+              instance-ent (task-id->instance-entity db-conn task-id)]
+          (is (= "localhost" (:instance/hostname instance-ent)))
+          (is (= :instance.status/running (:instance/status instance-ent)))
+          (is (= :executor/cook (:instance/executor instance-ent)))
+          (is (nil? (:instance/sandbox-directory instance-ent))))))))
+
+
+(deftest test-monitor-tx-report-queue
+  (let [conn (restore-fresh-database! "datomic:mem://test-monitor-tx-report-queue")
+        job-id-1 (create-dummy-job conn)
+        instance-id-1 (create-dummy-instance conn job-id-1)
+        job-id-2 (create-dummy-job conn)
+        instance-id-2 (create-dummy-instance conn job-id-2)
+        killed-tasks (atom [])
+        mock-driver (reify msched/SchedulerDriver
+                      (kill-task! [_ task-id]
+                        (swap! killed-tasks #(conj % task-id))))
+        driver-ref (ref mock-driver)]
+    (cook.mesos/kill-job conn [(:job/uuid (d/entity (d/db conn) job-id-1))])
+    (let [job-ent (d/entity (d/db conn) job-id-1)
+          instance-ent (d/entity (d/db conn) instance-id-1)]
+      (is (= :job.state/completed (:job/state job-ent)))
+      (is (= :instance.status/unknown (:instance/status instance-ent))))
+    (let [[report-mult close-fn] (cook.datomic/create-tx-report-mult conn)
+          transaction-chan (async/chan (async/sliding-buffer 4096))
+          _ (async/tap report-mult transaction-chan)
+          kill-fn (cook.mesos.scheduler/monitor-tx-report-queue transaction-chan conn driver-ref)]
+      (cook.mesos/kill-job conn [(:job/uuid (d/entity (d/db conn) job-id-2))])
+      (let [expected-tasks-killed [{:value (:instance/task-id (d/entity (d/db conn) instance-id-1))}
+                                   {:value (:instance/task-id (d/entity (d/db conn) instance-id-2))}]
+            tasks-killed? (fn [] (= expected-tasks-killed @killed-tasks))]
+        (is (wait-for tasks-killed? :interval 20 :timeout 100 :unit-multiplier 1))))))
+
+(deftest test-launch-matched-tasks!-logs-transaction-timeouts
+  (let [conn (restore-fresh-database! "datomic:mem://test-launch-matched-tasks!-logs-transaction-timeouts")
+        timeout-exception (ex-info "Transaction timed out." {})
+        logged-atom (atom nil)
+        job-id (create-dummy-job conn)
+        job (d/entity (d/db conn) job-id)
+        ^TaskRequest task-request (sched/make-task-request (d/db conn) job)
+        matches [{:tasks [(SimpleAssignmentResult. [] nil task-request)]}]]
+    (with-redefs [d/transact (fn [_ _]
+                               (throw timeout-exception))
+                  log/log* (fn [_ level throwable message]
+                             (when (= :warn level)
+                               (reset! logged-atom {:throwable throwable
+                                                    :message message})))]
+      (is (thrown? ExceptionInfo (sched/launch-matched-tasks! matches conn nil nil nil nil nil)))
+      (is (= timeout-exception (:throwable @logged-atom)))
+      (is (str/includes? (:message @logged-atom) (str job-id))))))

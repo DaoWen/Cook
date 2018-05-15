@@ -24,8 +24,8 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
-            [cook.components :refer (default-fitness-calculator)]
-            [cook.datomic :refer (transact-with-retries)]
+            [cook.config :refer (default-fitness-calculator)]
+            [cook.datomic :as datomic]
             [cook.mesos.constraints :as constraints]
             [cook.mesos.dru :as dru]
             [cook.mesos.fenzo-utils :as fenzo]
@@ -95,6 +95,8 @@
 (timers/deftimer [cook-mesos scheduler handle-framework-message-duration])
 (meters/defmeter [cook-mesos scheduler handle-framework-message-rate])
 (meters/defmeter [cook-mesos scheduler tasks-killed-in-status-update])
+
+(timers/deftimer [cook-mesos scheduler generate-user-usage-map-duration])
 
 (meters/defmeter [cook-mesos scheduler tasks-completed])
 (meters/defmeter [cook-mesos scheduler tasks-completed-mem])
@@ -171,9 +173,33 @@
                       (catch Exception e
                         (log/debug e "Error reading a string from mesos status data. Is it in the format we expect?")))))})
 
+(defn update-reason-metrics!
+  "Updates histograms and counters for run time, cpu time, and memory time,
+  where the histograms have the failure reason in the title"
+  [db mesos-reason instance-runtime {:keys [cpus mem]}]
+  (let [reason (->> mesos-reason
+                    (reason/mesos-reason->cook-reason-entity-id db)
+                    (d/entity db)
+                    :reason/name
+                    name)
+        update-metrics! (fn update-metrics! [s v]
+                          (histograms/update!
+                            (histograms/histogram
+                              ["cook-mesos" "scheduler" "hist-task-fail" reason s])
+                            v)
+                          (counters/inc!
+                            (counters/counter
+                              ["cook-mesos" "scheduler" "hist-task-fail" reason s "total"])
+                            v))
+        instance-runtime-seconds (/ instance-runtime 1000)
+        mem-gb (/ mem 1024)]
+    (update-metrics! "times" instance-runtime-seconds)
+    (update-metrics! "cpu-times" (* instance-runtime-seconds cpus))
+    (update-metrics! "mem-times" (* instance-runtime-seconds mem-gb))))
+
 (defn handle-status-update
   "Takes a status update from mesos."
-  [conn driver ^TaskScheduler fenzo status]
+  [conn driver ^TaskScheduler fenzo sync-agent-sandboxes-fn status]
   (log/info "Mesos status is:" status)
   (timers/time!
     handle-status-update-duration
@@ -233,7 +259,9 @@
                                         instance-runtime)
              (handle-throughput-metrics complete-throughput-metrics
                                         job-resources
-                                        instance-runtime))
+                                        instance-runtime)
+             (when-not previous-reason
+               (update-reason-metrics! db reason instance-runtime job-resources)))
            ;; This code kills any task that "shouldn't" be running
            (when (and
                    (or (nil? instance) ; We could know nothing about the task, meaning a DB error happened and it's a waste to finish
@@ -249,11 +277,15 @@
              (meters/mark! tasks-killed-in-status-update)
              (mesos/kill-task! driver {:value task-id}))
            (when-not (nil? instance)
+             (when (and (#{:task-starting :task-running} task-state)
+                        (not= :executor/cook (:instance/executor instance-ent)))
+               ;; cook executor tasks should automatically get sandbox directory updates
+               (sync-agent-sandboxes-fn (:instance/hostname instance-ent) task-id))
              ;; (println "update:" task-id task-state job instance instance-status prior-job-state)
              (log/debug "Transacting updated state for instance" instance "to status" instance-status)
              ;; The database can become inconsistent if we make multiple calls to :instance/update-state in a single
              ;; transaction; see the comment in the definition of :instance/update-state for more details
-             (transact-with-retries
+             (datomic/transact-with-retries
                conn
                (reduce
                  into
@@ -432,7 +464,7 @@
                                         :progress-sequence progress-sequence}))
             (when exit-code
               (log/info "Updating instance" instance-id "exit-code to" exit-code)
-              (transact-with-retries conn [[:db/add instance-id :instance/exit-code (int exit-code)]])))))
+              (datomic/transact-with-retries conn [[:db/add instance-id :instance/exit-code (int exit-code)]])))))
       (catch Exception e
         (log/error e "Mesos scheduler framework message error")))))
 
@@ -446,7 +478,25 @@
   "Takes an async channel that will have tx report queue elements on it"
   [tx-report-chan conn driver-ref]
   (log/info "Starting tx-report-queue")
-  (let [kill-chan (async/chan)]
+  (let [kill-chan (async/chan)
+        query-db (d/db conn)
+        query-basis (d/basis-t query-db)
+        tasks-to-kill (q '[:find ?task-id
+                           :in $ [?status ...]
+                           :where
+                           [?i :instance/status ?status]
+                           [?job :job/instance ?i]
+                           [?job :job/state :job.state/completed]
+                           [?i :instance/task-id ?task-id]]
+                         query-db [:instance.status/unknown :instance.status/running])]
+    (doseq [[task-id] tasks-to-kill]
+      (when-let [driver @driver-ref]
+        (try
+          (log/info "Attempting to kill task" task-id "from already completed job")
+          (meters/mark! tx-report-queue-tasks-killed)
+          (mesos/kill-task! driver {:value task-id})
+          (catch Exception e
+            (log/error e (str "Failed to kill task" task-id))))))
     (async/go
       (loop []
         (async/alt!
@@ -454,30 +504,31 @@
                            (async/go
                              (timers/start-stop-time! ; Use this in go blocks, time! doesn't play nice
                                tx-report-queue-processing-duration
-                               (let [{:keys [tx-data db-before]} tx-report
-                                     db (db conn)]
-                                 (meters/mark! tx-report-queue-datoms (count tx-data))
-                                 ;; Monitoring whether a job is completed.
-                                 (doseq [{:keys [e a v]} tx-data]
-                                   (try
-                                     (when (and (= a (d/entid db :job/state))
-                                                (= v (d/entid db :job.state/completed)))
-                                       (meters/mark! tx-report-queue-job-complete)
-                                       (doseq [[task-id] (q '[:find ?task-id
-                                                              :in $ ?job [?status ...]
-                                                              :where
-                                                              [?job :job/instance ?i]
-                                                              [?i :instance/status ?status]
-                                                              [?i :instance/task-id ?task-id]]
-                                                            db e [:instance.status/unknown
-                                                                  :instance.status/running])]
-                                         (if-let [driver @driver-ref]
-                                           (do (log/info "Attempting to kill task" task-id "due to job completion")
-                                               (meters/mark! tx-report-queue-tasks-killed)
-                                               (mesos/kill-task! driver {:value task-id}))
-                                           (log/error "Couldn't kill task" task-id "due to no Mesos driver!"))))
-                                     (catch Exception e
-                                       (log/error e "Unexpected exception on tx report queue processor")))))))
+                               (let [{:keys [tx-data db-after]} tx-report]
+                                 (when (< query-basis (d/basis-t db-after))
+                                   (let [db (db conn)]
+                                     (meters/mark! tx-report-queue-datoms (count tx-data))
+                                     ;; Monitoring whether a job is completed.
+                                     (doseq [{:keys [e a v]} tx-data]
+                                       (try
+                                         (when (and (= a (d/entid db :job/state))
+                                                    (= v (d/entid db :job.state/completed)))
+                                           (meters/mark! tx-report-queue-job-complete)
+                                           (doseq [[task-id] (q '[:find ?task-id
+                                                                  :in $ ?job [?status ...]
+                                                                  :where
+                                                                  [?job :job/instance ?i]
+                                                                  [?i :instance/status ?status]
+                                                                  [?i :instance/task-id ?task-id]]
+                                                                db e [:instance.status/unknown
+                                                                      :instance.status/running])]
+                                             (if-let [driver @driver-ref]
+                                               (do (log/info "Attempting to kill task" task-id "due to job completion")
+                                                   (meters/mark! tx-report-queue-tasks-killed)
+                                                   (mesos/kill-task! driver {:value task-id}))
+                                               (log/error "Couldn't kill task" task-id "due to no Mesos driver!"))))
+                                         (catch Exception e
+                                           (log/error e "Unexpected exception on tx report queue processor")))))))))
                            (recur))
           kill-chan ([_] nil))))
     #(async/close! kill-chan)))
@@ -575,18 +626,21 @@
    given a job, its resources, its task-id and a function assigned-cotask-getter. assigned-cotask-getter should be a
    function that takes a group uuid and returns a set of task-ids, which correspond to the tasks that will be assigned
    during the same Fenzo scheduling cycle as the newly created TaskRequest."
-  [db job & {:keys [resources task-id assigned-resources guuid->considerable-cotask-ids running-cotask-cache]
+  [db job & {:keys [resources task-id assigned-resources guuid->considerable-cotask-ids reserved-hosts running-cotask-cache]
           :or {resources (util/job-ent->resources job)
-               task-id (str (java.util.UUID/randomUUID))
+               task-id (str (d/squuid))
                assigned-resources (atom nil)
                guuid->considerable-cotask-ids (constantly #{})
-               running-cotask-cache (atom (cache/fifo-cache-factory {} :threshold 1))}}]
-  (let [constraints (into (constraints/make-fenzo-job-constraints job)
+               running-cotask-cache (atom (cache/fifo-cache-factory {} :threshold 1))
+               reserved-hosts #{}}}]
+  (let [constraints (-> (constraints/make-fenzo-job-constraints job)
+                        (conj (constraints/build-rebalancer-reservation-constraint reserved-hosts))
+                        (into
                           (remove nil?
                                   (mapv (fn make-group-constraints [group]
                                           (constraints/make-fenzo-group-constraint
                                            db group #(guuid->considerable-cotask-ids (:group/uuid group)) running-cotask-cache))
-                                        (:group/_job job))))
+                                        (:group/_job job)))))
         needs-gpus? (constraints/job-needs-gpus? job)
         scalar-requests (reduce (fn [result resource]
                                   (if-let [value (:resource/amount resource)]
@@ -604,7 +658,7 @@
 
    Returns {:matches (list of tasks that got matched to the offer)
             :failures (list of unmatched tasks, and why they weren't matched)}"
-  [db ^TaskScheduler fenzo considerable offers]
+  [db ^TaskScheduler fenzo considerable offers rebalancer-reservation-atom]
   (log/debug "Matching" (count offers) "offers to" (count considerable) "jobs with fenzo")
   (log/debug "offers to scheduleOnce" offers)
   (log/debug "tasks to scheduleOnce" considerable)
@@ -615,10 +669,15 @@
         considerable->task-id (plumbing.core/map-from-keys (fn [_] (str (java.util.UUID/randomUUID))) considerable)
         guuid->considerable-cotask-ids (util/make-guuid->considerable-cotask-ids considerable->task-id)
         running-cotask-cache (atom (cache/fifo-cache-factory {} :threshold (max 1 (count considerable))))
+        job-uuid->reserved-host (or (:job-uuid->reserved-host @rebalancer-reservation-atom) {})
+        reserved-hosts (into (hash-set) (vals job-uuid->reserved-host))
         ; Important that requests maintains the same order as considerable
         requests (mapv (fn [job]
-                         (make-task-request db job :task-id (considerable->task-id job) :guuid->considerable-cotask-ids guuid->considerable-cotask-ids
-                                            :running-cotask-cache running-cotask-cache))
+                         (make-task-request db job
+                                            :guuid->considerable-cotask-ids guuid->considerable-cotask-ids
+                                            :reserved-hosts (disj reserved-hosts (job-uuid->reserved-host (:job/uuid job)))
+                                            :running-cotask-cache running-cotask-cache
+                                            :task-id (considerable->task-id job)))
                        considerable)
         ;; Need to lock on fenzo when accessing scheduleOnce because scheduleOnce and
         ;; task assigner can not be called at the same time.
@@ -703,13 +762,15 @@
 (defn generate-user-usage-map
   "Returns a mapping from user to usage stats"
   [unfiltered-db]
-  (->> (util/get-running-task-ents unfiltered-db)
-       (map :job/_instance)
-       (group-by :job/user)
-       (pc/map-vals (fn [jobs]
-                      (->> jobs
-                           (map job->usage)
-                           (reduce (partial merge-with +)))))))
+  (timers/time!
+    generate-user-usage-map-duration
+    (->> (util/get-running-task-ents unfiltered-db)
+         (map :job/_instance)
+         (group-by :job/user)
+         (pc/map-vals (fn [jobs]
+                        (->> jobs
+                             (map job->usage)
+                             (reduce (partial merge-with +))))))))
 
 (defn category->pending-jobs->category->considerable-jobs
   "Limit the pending jobs to considerable jobs based on usage and quota.
@@ -755,12 +816,12 @@
 
 (defn- update-match-with-task-metadata-seq
   "Updates the match with an entry for the task metadata for all tasks."
-  [{:keys [tasks] :as match} db framework-id executor-config]
-  (let [task-metadata-seq (->> tasks
-                               ;; sort-by makes task-txns created in matches->task-txns deterministic
-                               (sort-by (comp :job/uuid :job #(.getRequest ^TaskAssignmentResult %)) )
-                               (map (partial task/TaskAssignmentResult->task-metadata db framework-id executor-config)))]
-    (assoc match :task-metadata-seq task-metadata-seq)))
+  [{:keys [tasks] :as match} db framework-id mesos-run-as-user]
+  (->> tasks
+       ;; sort-by makes task-txns created in matches->task-txns deterministic
+       (sort-by (comp :job/uuid :job #(.getRequest ^TaskAssignmentResult %)))
+       (map (partial task/TaskAssignmentResult->task-metadata db framework-id mesos-run-as-user))
+       (assoc match :task-metadata-seq)))
 
 (defn- matches->task-txns
   "Converts matches to a task transactions."
@@ -788,10 +849,10 @@
       :instance/status :instance.status/unknown
       :instance/task-id task-id}]))
 
-(defn- launch-matched-tasks!
+(defn launch-matched-tasks!
   "Updates the state of matched tasks in the database and then launches them."
-  [matches conn db driver fenzo framework-id executor-config]
-  (let [matches (map #(update-match-with-task-metadata-seq % db framework-id executor-config) matches)
+  [matches conn db driver fenzo framework-id mesos-run-as-user]
+  (let [matches (map #(update-match-with-task-metadata-seq % db framework-id mesos-run-as-user) matches)
         task-txns (matches->task-txns matches)]
     ;; Note that this transaction can fail if a job was scheduled
     ;; during a race. If that happens, then other jobs that should
@@ -799,9 +860,15 @@
     ;; the pending-jobs atom is repopulated
     (timers/time!
       handle-resource-offer!-transact-task-duration
-      @(d/transact
-         conn
-         (reduce into [] task-txns)))
+      (datomic/transact
+        conn
+        (reduce into [] task-txns)
+        (fn [e]
+          (log/warn e
+                    "Transaction timed out, so these tasks might be present"
+                    "in Datomic without actually having been launched in Mesos"
+                    matches)
+          (throw e))))
     (log/info "Launching" (count task-txns) "tasks")
     (log/debug "Matched tasks" task-txns)
     ;; This launch-tasks MUST happen after the above transaction in
@@ -827,10 +894,25 @@
                 (getTaskAssigner)
                 (call task-request hostname))))))))
 
+(defn update-host-reservations!
+  "Updates the rebalancer-reservation-atom with the result of the match cycle.
+   - Releases reservations for jobs that were matched
+   - Adds matched job uuids to the launched-job-uuids list"
+  [rebalancer-reservation-atom matches]
+  (let [matched-job-uuids (->> matches
+                               (mapcat #(-> % :tasks))
+                               (map #(-> % .getRequest :job))
+                               (map :job/uuid)
+                               (into (hash-set)))]
+    (swap! rebalancer-reservation-atom (fn [{:keys [job-uuid->reserved-host launched-job-uuids]}]
+                                         {:job-uuid->reserved-host (apply dissoc job-uuid->reserved-host matched-job-uuids)
+                                          :launched-job-uuids (into matched-job-uuids launched-job-uuids)}))))
+
 (defn handle-resource-offers!
   "Gets a list of offers from mesos. Decides what to do with them all--they should all
    be accepted or rejected at the end of the function."
-  [conn driver ^TaskScheduler fenzo framework-id executor-config category->pending-jobs-atom offer-cache user->usage user->quota num-considerable offers-chan offers]
+  [conn driver ^TaskScheduler fenzo framework-id category->pending-jobs-atom mesos-run-as-user
+   user->usage user->quota num-considerable offers-chan offers rebalancer-reservation-atom]
   (log/debug "invoked handle-resource-offers!")
   (let [offer-stash (atom nil)] ;; This is a way to ensure we never lose offers fenzo assigned if an error occurs in the middle of processing
     ;; TODO: It is possible to have an offer expire by mesos because we recycle it a bunch of times.
@@ -846,7 +928,7 @@
                                               db category->pending-jobs user->quota user->usage num-considerable))
               {:keys [matches failures]} (timers/time!
                                            handle-resource-offer!-match-duration
-                                           (match-offer-to-schedule db fenzo (reduce into [] (vals category->considerable-jobs)) offers))
+                                           (match-offer-to-schedule db fenzo (reduce into [] (vals category->considerable-jobs)) offers rebalancer-reservation-atom))
               _ (log/debug "got matches:" matches)
               offers-scheduled (for [{:keys [leases]} matches
                                      lease leases]
@@ -874,7 +956,8 @@
             (do
               (swap! category->pending-jobs-atom remove-matched-jobs-from-pending-jobs category->job-uuids)
               (log/debug "updated category->pending-jobs:" @category->pending-jobs-atom)
-              (launch-matched-tasks! matches conn db driver fenzo framework-id executor-config)
+              (launch-matched-tasks! matches conn db driver fenzo framework-id mesos-run-as-user)
+              (update-host-reservations! rebalancer-reservation-atom matches)
               matched-normal-considerable-jobs-head?)))
         (catch Throwable t
           (meters/mark! handle-resource-offer!-errors)
@@ -903,10 +986,9 @@
 (counters/defcounter [cook-mesos scheduler offer-chan-depth])
 
 (defn make-offer-handler
-  [conn driver-atom fenzo framework-id executor-config pending-jobs-atom offer-cache
-   max-considerable scaleback
-   floor-iterations-before-warn floor-iterations-before-reset
-   trigger-chan]
+  [conn driver-atom fenzo framework-id pending-jobs-atom offer-cache max-considerable scaleback
+   floor-iterations-before-warn floor-iterations-before-reset trigger-chan rebalancer-reservation-atom
+   mesos-run-as-user]
   (let [chan-length 100
         offers-chan (async/chan (async/buffer chan-length))
         resources-atom (atom (view-incubating-offers fenzo))]
@@ -951,8 +1033,8 @@
                                                  (cache/hit c slave-id)
                                                  (cache/miss c slave-id attrs)))))
                       _ (log/debug "Passing following offers to handle-resource-offers!" offers)
-                      user->quota (quota/create-user->quota-fn (d/db conn))
-                      matched-head? (handle-resource-offers! conn @driver-atom fenzo framework-id executor-config pending-jobs-atom offer-cache @user->usage-future user->quota num-considerable offers-chan offers)]
+                      user->quota (quota/create-user->quota-fn (d/db conn) nil)
+                      matched-head? (handle-resource-offers! conn @driver-atom fenzo framework-id pending-jobs-atom mesos-run-as-user @user->usage-future user->quota num-considerable offers-chan offers rebalancer-reservation-atom)]
                   (when (seq offers)
                     (reset! resources-atom (view-incubating-offers fenzo)))
                   ;; This check ensures that, although we value Fenzo's optimizations,
@@ -998,10 +1080,10 @@
                            (db conn) [:job.state/waiting
                                       :job.state/running]))]
     (doseq [js (partition-all 25 jobs)]
-      (async/<!! (transact-with-retries conn
-                                        (mapv (fn [j]
-                                                [:job/update-state j])
-                                              js))))))
+      (async/<!! (datomic/transact-with-retries conn
+                                                (mapv (fn [j]
+                                                        [:job/update-state j])
+                                                      js))))))
 
 ;; TODO test that this fenzo recovery system actually works
 (defn reconcile-tasks
@@ -1021,24 +1103,28 @@
     (when (seq running-tasks)
       (log/info "Preparing to reconcile" (count running-tasks) "tasks")
       ;; TODO: When turning on periodic reconcilation, probably want to move this to startup
-      (doseq [[task-id] running-tasks
-              :let [task-ent (d/entity db [:instance/task-id task-id])
-                    hostname (:instance/hostname task-ent)
-                    job (util/job-ent->map (:job/_instance task-ent))
-                    task-request (make-task-request db job :task-id task-id)]]
-        ;; Need to lock on fenzo when accessing taskAssigner because taskAssigner and
-        ;; scheduleOnce can not be called at the same time.
-        (locking fenzo
-          (.. fenzo
-              (getTaskAssigner)
-              (call task-request hostname))))
-      (doseq [ts (partition-all 50 running-tasks)]
-        (log/info "Reconciling" (count ts) "tasks, including task" (first ts))
-        (mesos/reconcile-tasks driver (mapv (fn [[task-id status slave-id]]
-                                              {:task-id {:value task-id}
-                                               :state (sched->mesos status)
-                                               :slave-id {:value slave-id}})
-                                            ts)))
+      (let [processed-tasks (->> (for [[task-id] running-tasks
+                                       :let [task-ent (d/entity db [:instance/task-id task-id])
+                                             hostname (:instance/hostname task-ent)]]
+                                   (when-let [job (util/job-ent->map (:job/_instance task-ent))]
+                                     (let [task-request (make-task-request db job :task-id task-id)]
+                                       ;; Need to lock on fenzo when accessing taskAssigner because taskAssigner and
+                                       ;; scheduleOnce can not be called at the same time.
+                                       (locking fenzo
+                                         (.. fenzo
+                                             (getTaskAssigner)
+                                             (call task-request hostname)))
+                                       [task-id])))
+                                 (remove nil?))]
+        (when (not= (count running-tasks) (count processed-tasks))
+          (log/error "Skipping reconciling" (- (count running-tasks) (count processed-tasks)) "tasks"))
+        (doseq [ts (partition-all 50 processed-tasks)]
+          (log/info "Reconciling" (count ts) "tasks, including task" (first ts))
+          (mesos/reconcile-tasks driver (mapv (fn [[task-id status slave-id]]
+                                                {:task-id {:value task-id}
+                                                 :state (sched->mesos status)
+                                                 :slave-id {:value slave-id}})
+                                              ts))))
       (log/info "Finished reconciling all tasks"))))
 
 (timers/deftimer [cook-mesos scheduler reconciler-duration])
@@ -1271,7 +1357,7 @@
         category->pending-task-ents (pc/map-vals #(map util/create-task-ent %1) category->pending-job-ents)
         category->running-task-ents (group-by (comp util/categorize-job :job/_instance)
                                               (util/get-running-task-ents unfiltered-db))
-        user->dru-divisors (share/create-user->share-fn unfiltered-db)
+        user->dru-divisors (share/create-user->share-fn unfiltered-db nil)
         category->sort-jobs-by-dru-fn {:normal sort-normal-jobs-by-dru, :gpu sort-gpu-jobs-by-dru}]
     (letfn [(sort-jobs-by-dru-category-helper [[category sort-jobs-by-dru]]
              (let [pending-tasks (category->pending-task-ents category)
@@ -1328,12 +1414,12 @@
               ;; Transact synchronously so that it won't accidentally put a huge
               ;; spike of load on the transactor.
               (async/<!!
-                (transact-with-retries conn
-                                       (mapv
-                                         (fn [job]
-                                           [:db/add [:job/uuid (:job/uuid job)]
-                                            :job/state :job.state/completed])
-                                         jobs))))
+                (datomic/transact-with-retries conn
+                                               (mapv
+                                                 (fn [job]
+                                                   [:db/add [:job/uuid (:job/uuid job)]
+                                                    :job/state :job.state/completed])
+                                                 jobs))))
             (log/warn "Suppressed offensive" (count offensive-jobs) "jobs" (mapv :job/uuid offensive-jobs))
             (catch Exception e
               (log/error e "Failed to kill the offensive job!")))
@@ -1354,7 +1440,8 @@
       (let [jobs (->> (sort-jobs-by-dru-category unfiltered-db)
                       ;; Apply the offensive job filter first before taking.
                       (pc/map-vals offensive-job-filter)
-                      (pc/map-vals #(map util/job-ent->map %)))]
+                      (pc/map-vals #(map util/job-ent->map %))
+                      (pc/map-vals #(remove nil? %)))]
         (log/debug "Total number of pending jobs is:" (apply + (map count (vals jobs)))
                    "The first 20 pending normal jobs:" (take 20 (:normal jobs))
                    "The first 5 pending gpu jobs:" (take 5 (:gpu jobs)))
@@ -1490,90 +1577,94 @@
 (defn create-mesos-scheduler
   "Creates the mesos scheduler which processes status updates asynchronously but in order of receipt."
   [configured-framework-id gpu-enabled? conn heartbeat-ch fenzo offers-chan match-trigger-chan handle-progress-message
-   sandbox-publisher-state]
-  (mesos/scheduler
-    (registered
-      [this driver framework-id master-info]
-      (log/info "Registered with mesos with framework-id " framework-id)
-      (let [value (-> framework-id mesomatic.types/pb->data :value)]
-        (when (not= configured-framework-id value)
-          (let [message (str "The framework-id provided by Mesos (" value ") "
-                             "does not match the one Cook is configured with (" configured-framework-id ")")]
-            (log/error message)
-            (throw (ex-info message {:framework-id-mesos value :framework-id-cook configured-framework-id})))))
-      (when (and gpu-enabled? (not (re-matches #"1\.\d+\.\d+" (:version master-info))))
-        (binding [*out* *err*]
-          (println "Cannot enable GPU support on pre-mesos 1.0. The version we found was " (:version master-info)))
-        (log/error "Cannot enable GPU support on pre-mesos 1.0. The version we found was " (:version master-info))
-        (Thread/sleep 1000)
-        (System/exit 1))
-      ;; Use future because the thread that runs mesos/scheduler doesn't load classes correctly. for reasons.
-      ;; As Sophie says, you want to future proof your code.
-      (future
+   sandbox-syncer-state]
+  (let [sync-agent-sandboxes-fn #(sandbox/sync-agent-sandboxes sandbox-syncer-state configured-framework-id %1 %2)]
+    (mesos/scheduler
+      (registered
+        [this driver framework-id master-info]
+        (log/info "Registered with mesos with framework-id " framework-id)
+        (let [value (-> framework-id mesomatic.types/pb->data :value)]
+          (when (not= configured-framework-id value)
+            (let [message (str "The framework-id provided by Mesos (" value ") "
+                               "does not match the one Cook is configured with (" configured-framework-id ")")]
+              (log/error message)
+              (throw (ex-info message {:framework-id-mesos value :framework-id-cook configured-framework-id})))))
+        (when (and gpu-enabled? (not (re-matches #"1\.\d+\.\d+" (:version master-info))))
+          (binding [*out* *err*]
+            (println "Cannot enable GPU support on pre-mesos 1.0. The version we found was " (:version master-info)))
+          (log/error "Cannot enable GPU support on pre-mesos 1.0. The version we found was " (:version master-info))
+          (Thread/sleep 1000)
+          (System/exit 1))
+        ;; Use future because the thread that runs mesos/scheduler doesn't load classes correctly. for reasons.
+        ;; As Sophie says, you want to future proof your code.
+        (future
+          (try
+            (reconcile-jobs conn)
+            (reconcile-tasks (db conn) driver configured-framework-id fenzo)
+            (catch Exception e
+              (log/error e "Reconciliation error")))))
+      (reregistered
+        [this driver master-info]
+        (log/info "Reregistered with new master")
+        (future
+          (try
+            (reconcile-jobs conn)
+            (reconcile-tasks (db conn) driver configured-framework-id fenzo)
+            (catch Exception e
+              (log/error e "Reconciliation error")))))
+      ;; Ignore this--we can just wait for new offers
+      (offer-rescinded
+        [this driver offer-id]
+        (comment "TODO: Rescind the offer in fenzo"))
+      (framework-message
+        [this driver executor-id slave-id message]
+        (meters/mark! handle-framework-message-rate)
         (try
-          (reconcile-jobs conn)
-          (reconcile-tasks (db conn) driver configured-framework-id fenzo)
+          (let [{:strs [task-id type] :as parsed-message} (json/read-str (String. ^bytes message "UTF-8"))]
+            (case type
+              "directory" (sandbox/update-sandbox sandbox-syncer-state parsed-message)
+              "heartbeat" (heartbeat/notify-heartbeat heartbeat-ch executor-id slave-id parsed-message)
+              (async-in-order-processing
+                task-id #(handle-framework-message conn handle-progress-message parsed-message))))
           (catch Exception e
-            (log/error e "Reconciliation error")))))
-    (reregistered
-      [this driver master-info]
-      (log/info "Reregistered with new master")
-      (future
-        (try
-          (reconcile-jobs conn)
-          (reconcile-tasks (db conn) driver configured-framework-id fenzo)
-          (catch Exception e
-            (log/error e "Reconciliation error")))))
-    ;; Ignore this--we can just wait for new offers
-    (offer-rescinded
-      [this driver offer-id]
-      (comment "TODO: Rescind the offer in fenzo"))
-    (framework-message
-      [this driver executor-id slave-id message]
-      (meters/mark! handle-framework-message-rate)
-      (try
-        (let [{:strs [task-id type] :as parsed-message} (json/read-str (String. ^bytes message "UTF-8"))]
-          (case type
-            "directory" (sandbox/update-sandbox sandbox-publisher-state parsed-message)
-            "heartbeat" (heartbeat/notify-heartbeat heartbeat-ch executor-id slave-id parsed-message)
-            (async-in-order-processing
-              task-id #(handle-framework-message conn handle-progress-message parsed-message))))
-        (catch Exception e
-          (log/error e "Unable to process framework message"
-                     {:executor-id executor-id, :message message, :slave-id slave-id}))))
-    (disconnected
-      [this driver]
-      (log/error "Disconnected from the previous master"))
-    ;; We don't care about losing slaves or executors--only tasks
-    (slave-lost [this driver slave-id])
-    (executor-lost [this driver executor-id slave-id status])
-    (error
-      [this driver message]
-      (meters/mark! mesos-error)
-      (log/error "Got a mesos error!!!!" message))
-    (resource-offers
-      [this driver offers]
-      (receive-offers offers-chan match-trigger-chan driver offers))
-    (status-update
-      [this driver status]
-      (meters/mark! handle-status-update-rate)
-      (let [task-id (-> status :task-id :value)]
-        (async-in-order-processing
-          task-id #(handle-status-update conn driver fenzo status))))))
+            (log/error e "Unable to process framework message"
+                       {:executor-id executor-id, :message message, :slave-id slave-id}))))
+      (disconnected
+        [this driver]
+        (log/error "Disconnected from the previous master"))
+      ;; We don't care about losing slaves or executors--only tasks
+      (slave-lost [this driver slave-id])
+      (executor-lost [this driver executor-id slave-id status])
+      (error
+        [this driver message]
+        (meters/mark! mesos-error)
+        (log/error "Got a mesos error!!!!" message))
+      (resource-offers
+        [this driver offers]
+        (receive-offers offers-chan match-trigger-chan driver offers))
+      (status-update
+        [this driver status]
+        (meters/mark! handle-status-update-rate)
+        (let [task-id (-> status :task-id :value)]
+          (async-in-order-processing
+            task-id #(handle-status-update conn driver fenzo sync-agent-sandboxes-fn status)))))))
 
 (defn create-datomic-scheduler
-  [conn driver-atom pending-jobs-atom offer-cache heartbeat-ch offer-incubate-time-ms mea-culpa-failure-limit
-   fenzo-max-jobs-considered fenzo-scaleback fenzo-floor-iterations-before-warn fenzo-floor-iterations-before-reset
-   fenzo-fitness-calculator task-constraints gpu-enabled? good-enough-fitness framework-id sandbox-publisher-state
-   executor-config progress-config trigger-chans]
+  [{:keys [conn driver-atom fenzo-fitness-calculator fenzo-floor-iterations-before-reset
+           fenzo-floor-iterations-before-warn fenzo-max-jobs-considered fenzo-scaleback framework-id good-enough-fitness
+           gpu-enabled? heartbeat-ch mea-culpa-failure-limit mesos-run-as-user offer-cache offer-incubate-time-ms
+           pending-jobs-atom progress-config rebalancer-reservation-atom sandbox-syncer-state task-constraints
+           trigger-chans]}]
 
   (persist-mea-culpa-failure-limit! conn mea-culpa-failure-limit)
 
   (let [{:keys [match-trigger-chan progress-updater-trigger-chan rank-trigger-chan]} trigger-chans
         fenzo (make-fenzo-scheduler driver-atom offer-incubate-time-ms fenzo-fitness-calculator good-enough-fitness)
         [offers-chan resources-atom]
-        (make-offer-handler conn driver-atom fenzo framework-id executor-config pending-jobs-atom offer-cache fenzo-max-jobs-considered
-                            fenzo-scaleback fenzo-floor-iterations-before-warn fenzo-floor-iterations-before-reset match-trigger-chan)
+        (make-offer-handler
+          conn driver-atom fenzo framework-id pending-jobs-atom offer-cache fenzo-max-jobs-considered
+          fenzo-scaleback fenzo-floor-iterations-before-warn fenzo-floor-iterations-before-reset match-trigger-chan
+          rebalancer-reservation-atom mesos-run-as-user)
         {:keys [batch-size]} progress-config
         {:keys [progress-state-chan]} (progress-update-transactor progress-updater-trigger-chan batch-size conn)
         progress-aggregator-chan (progress-update-aggregator progress-config progress-state-chan)
@@ -1581,5 +1672,5 @@
                                   (handle-progress-message! progress-aggregator-chan progress-message-map))]
     (start-jobs-prioritizer! conn pending-jobs-atom task-constraints rank-trigger-chan)
     {:scheduler (create-mesos-scheduler framework-id gpu-enabled? conn heartbeat-ch fenzo offers-chan
-                                        match-trigger-chan handle-progress-message sandbox-publisher-state)
+                                        match-trigger-chan handle-progress-message sandbox-syncer-state)
      :view-incubating-offers (fn get-resources-atom [] @resources-atom)}))

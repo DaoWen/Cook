@@ -1,16 +1,21 @@
 import functools
 import importlib
 import itertools
+import json
 import logging
 import os
 import os.path
 import subprocess
 import time
 import uuid
+from datetime import datetime
 from urllib.parse import urlencode
 
+import numpy
 import requests
 from retrying import retry
+
+from tests.cook import mesos
 
 logger = logging.getLogger(__name__)
 session = importlib.import_module(os.getenv('COOK_SESSION_MODULE', 'requests')).Session()
@@ -27,9 +32,10 @@ DEFAULT_TIMEOUT_MS = 120000
 # Name of our custom HTTP header for user impersonation
 IMPERSONATION_HEADER = 'X-Cook-Impersonate'
 
+
 def continuous_integration():
     """Returns true if the CONTINUOUS_INTEGRATION environment variable is set, as done by Travis-CI."""
-    return os.environ.get('CONTINUOUS_INTEGRATION')
+    return os.getenv('CONTINUOUS_INTEGRATION')
 
 
 def has_docker_service():
@@ -42,11 +48,43 @@ _default_user_name = 'root'
 _default_admin_name = 'root'
 _default_impersonator_name = 'poser'
 
+
 def _get_default_user_name():
     return os.getenv('USER', _default_user_name)
 
+
+@functools.lru_cache()
+def _test_user_ids():
+    """
+    Get the numeric user suffixes for this test worker.
+    Returns the range 0 to 1 million if COOK_MAX_TEST_USERS is not set.
+    If this is a distributed run with a limited number of users,
+    e.g., 10 per worker, then this function returns range(0, 10) for worker 0,
+    or range(20, 30) for worker 2.
+    """
+    pytest_worker = os.getenv('PYTEST_XDIST_WORKER')
+    max_test_users = int(os.getenv('COOK_MAX_TEST_USERS', 0))
+    if pytest_worker and max_test_users:
+        pytest_worker_id = int(pytest_worker[2:])  # e.g., "gw4" -> 4
+        test_user_min_id = max_test_users * pytest_worker_id
+        test_user_max_id = test_user_min_id + max_test_users
+        return range(test_user_min_id, test_user_max_id)
+    else:
+        return range(1000000)
+
+
+def _test_user_names(test_name_prefix=None):
+    """
+    Returns a generator of unique test user names, with form {PREFIX}{ID}.
+    The COOK_TEST_USER_PREFIX environment variable is used by default;
+    otherwise, the test_name_prefix value is used as the PREFIX.
+    """
+    name_prefix = os.getenv('COOK_TEST_USER_PREFIX', test_name_prefix)
+    return (f'{name_prefix}{i}' for i in _test_user_ids())
+
+
 # Shell command used to obtain Kerberos credentials for a given test user
-_kerberos_missing_cmd =  'echo "MISSING COOK_KERBEROS_TEST_AUTH_CMD" && exit 1'
+_kerberos_missing_cmd = 'echo "MISSING COOK_KERBEROS_TEST_AUTH_CMD" && exit 1'
 _kerberos_auth_cmd = os.getenv('COOK_KERBEROS_TEST_AUTH_CMD', _kerberos_missing_cmd)
 
 
@@ -114,11 +152,20 @@ class _KerberosUser(_AuthenticatedUser):
 
     def __init__(self, name, impersonatee=None):
         super().__init__(name, impersonatee)
-        subcommand = (_kerberos_auth_cmd
-                      .replace('{{COOK_USER}}', name)
-                      .replace('{{COOK_SCHEDULER_URL}}', retrieve_cook_url()))
-        self.auth_token = subprocess.check_output(subcommand, shell=True).rstrip()
+        self.auth = None
+        self.auth_token = self._generate_kerberos_ticket_for_user(name)
         self.previous_token = None
+
+    @functools.lru_cache()
+    def _generate_kerberos_ticket_for_user(self, username):
+        """
+        Get a Kerberos authentication ticket for the given user.
+        Depends on COOK_KERBEROS_TEST_AUTH_CMD being set in the environment.
+        """
+        subcommand = (_kerberos_auth_cmd
+                      .replace('{{COOK_USER}}', username)
+                      .replace('{{COOK_SCHEDULER_URL}}', retrieve_cook_url()))
+        return subprocess.check_output(subcommand, shell=True).rstrip()
 
     def __enter__(self):
         global session
@@ -154,9 +201,8 @@ class UserFactory(object):
         # Set up generator for new user objects
         if test_handle:
             test_id = test_handle.id()
-            test_base_name = test_id[test_id.rindex('.test_')+6:].lower()
-            base_name = os.getenv('COOK_TEST_USER_PREFIX', f'{test_base_name}_')
-            self.__user_generator = (f'{base_name}{i}' for i in range(1000000))
+            test_base_name = test_id[test_id.rindex('.test_') + 6:].lower()
+            self.__user_generator = _test_user_names(test_base_name)
 
     def new_user(self):
         """Return a fresh user object."""
@@ -164,7 +210,7 @@ class UserFactory(object):
 
     def new_users(self, count=None):
         """Return a sequence of `count` fresh user objects."""
-        return map(self.user_class, itertools.islice(self.__user_generator, 0, count))
+        return [self.user_class(x) for x in itertools.islice(self.__user_generator, 0, count)]
 
     @functools.lru_cache()
     def default(self):
@@ -219,6 +265,8 @@ def multi_user_tests_enabled():
 
 def get_in(dct, *keys):
     for key in keys:
+        if not dct:
+            return None
         try:
             dct = dct[key]
         except KeyError:
@@ -337,7 +385,7 @@ def minimal_group(**kwargs):
     return dict(uuid=str(uuid.uuid4()), **kwargs)
 
 
-def submit_jobs(cook_url, job_specs, clones=1, **kwargs):
+def submit_jobs(cook_url, job_specs, clones=1, pool=None, **kwargs):
     """
     Create and submit multiple jobs, either cloned from a single job spec,
     or specified individually in multiple job specs.
@@ -354,9 +402,11 @@ def submit_jobs(cook_url, job_specs, clones=1, **kwargs):
 
     jobs = [full_spec(j) for j in job_specs]
     request_body = {'jobs': jobs}
+    if pool:
+        request_body['pool'] = pool
     request_body.update(kwargs)
     logger.info(request_body)
-    resp = session.post(f'{cook_url}/rawscheduler', json=request_body)
+    resp = session.post(f'{cook_url}/jobs', json=request_body)
     return [j['uuid'] for j in jobs], resp
 
 
@@ -393,9 +443,9 @@ def kill_groups(cook_url, groups, assert_response=True, expected_status_code=204
     return response
 
 
-def submit_job(cook_url, **kwargs):
+def submit_job(cook_url, pool=None, **kwargs):
     """Create and submit a single job"""
-    uuids, resp = submit_jobs(cook_url, job_specs=[kwargs])
+    uuids, resp = submit_jobs(cook_url, job_specs=[kwargs], pool=pool)
     return uuids[0], resp
 
 
@@ -476,10 +526,6 @@ def load_job(cook_url, job_uuid, assert_response=True):
 def load_instance(cook_url, instance_uuid, assert_response=True):
     """Loads a job instance by UUID using GET /instances/UUID"""
     return load_resource(cook_url, 'instances', instance_uuid, assert_response)
-
-
-def multi_cluster_tests_enabled():
-    return os.getenv('COOK_MULTI_CLUSTER') is not None
 
 
 def wait_until(query, predicate, max_wait_ms=DEFAULT_TIMEOUT_MS, wait_interval_ms=1000):
@@ -624,7 +670,8 @@ def wait_for_sandbox_directory(cook_url, job_id):
 
     cook_settings = settings(cook_url)
     cache_ttl_ms = cook_settings['agent-query-cache']['ttl-ms']
-    max_wait_ms = min(4 * cache_ttl_ms, 4 * 60 * 1000)
+    sync_interval_ms = cook_settings['sandbox-syncer']['sync-interval-ms']
+    max_wait_ms = min(4 * max(cache_ttl_ms, sync_interval_ms), 4 * 60 * 1000)
 
     def query():
         response = query_jobs(cook_url, True, uuid=[job_id])
@@ -672,6 +719,27 @@ def wait_for_end_time(cook_url, job_id, max_wait_ms=DEFAULT_TIMEOUT_MS):
     return response.json()[0]
 
 
+def wait_for_running_instance(cook_url, job_id, max_wait_ms=DEFAULT_TIMEOUT_MS):
+    """Waits for the job with the given job_id to have a running instance"""
+    job_id = unpack_uuid(job_id)
+
+    def query():
+        return query_jobs(cook_url, True, uuid=[job_id])
+
+    def predicate(resp):
+        job = resp.json()[0]
+        if not job['instances']:
+            logger.info(f"Job {job_id} has no instances.")
+        else:
+            for inst in job['instances']:
+                status = inst['status']
+                logger.info(f"Job {job_id} instance {inst['task_id']} has status {status}, expected running.")
+                return status == 'running'
+
+    response = wait_until(query, predicate, max_wait_ms=max_wait_ms)
+    return response.json()[0]['instances'][0]
+
+
 def get_mesos_state(mesos_url):
     """
     Queries the state.json from mesos
@@ -711,6 +779,13 @@ def list_jobs(cook_url, **kwargs):
     return resp
 
 
+def jobs(cook_url, **kwargs):
+    """Makes a request to the /jobs endpoint using the provided kwargs as the query params"""
+    query_params = urlencode(kwargs, doseq=True)
+    resp = session.get('%s/jobs?%s' % (cook_url, query_params))
+    return resp
+
+
 def contains_job_uuid(jobs, job_uuid):
     """Returns true if jobs contains a job with the given uuid"""
     return any(job for job in jobs if job['uuid'] == job_uuid)
@@ -743,6 +818,7 @@ def wait_for_instance(cook_url, job_uuid):
     """Waits for the job with the given job_uuid to have a single instance, and returns the instance uuid"""
     job = wait_until(lambda: load_job(cook_url, job_uuid), lambda j: len(j['instances']) == 1)
     instance = job['instances'][0]
+    instance['parent'] = job
     return instance
 
 
@@ -802,12 +878,21 @@ def group_submit_kill_retry(cook_url, retry_failed_jobs_only):
             return query_jobs(cook_url, True, uuid=jobs)
 
         wait_until(jobs_query, all_instances_done)
+        jobs = query_jobs(cook_url, assert_response=True, uuid=jobs).json()
+        for job in jobs:
+            logger.info(f'Job details: {json.dumps(job, sort_keys=True)}')
         # retry all jobs in the group
         retry_jobs(cook_url, retries=2, groups=[group_uuid], failed_only=retry_failed_jobs_only)
         # wait for some job to start
         wait_until(group_query, group_some_job_started)
         # return final job details to caller for assertion checks
-        return query_jobs(cook_url, assert_response=True, uuid=jobs).json()
+        jobs = query_jobs(cook_url, assert_response=True, uuid=jobs).json()
+        for job in jobs:
+            logger.info(f'Dumping sandbox files for job {job}')
+            for instance in job['instances']:
+                logger.info(f'Dumping sandbox files for instance {instance}')
+                mesos.dump_sandbox_files(session, instance, job)
+        return jobs
     finally:
         # ensure that we don't leave a bunch of jobs running/waiting
         kill_groups(cook_url, [group_uuid])
@@ -838,7 +923,14 @@ def group_submit_retry(cook_url, command, predicate_statuses, retry_failed_jobs_
         # for running & waiting, we want at least one running (not all waiting)
         not_all_waiting = group['waiting'] != job_count
         logger.debug(f"Currently {statuses_map} jobs in group {group['uuid']}")
-        return not_all_waiting and sum(status_counts) == job_count
+        if not_all_waiting and sum(status_counts) == job_count:
+            return True
+        else:
+            logger.debug(f'Group details: {group}')
+            jobs = query_jobs(cook_url, assert_response=True, uuid=group['jobs']).json()
+            for job in jobs:
+                logger.debug(f'Job details: {json.dumps(job, sort_keys=True)}')
+            return False
 
     try:
         jobs, resp = submit_jobs(cook_url, job_spec, job_count, groups=[group_spec])
@@ -869,20 +961,47 @@ def query_queue(cook_url):
     return session.get(f'{cook_url}/queue')
 
 
-def set_limit(cook_url, limit_type, user, mem=None, cpus=None, gpus=None, jobs=None, reason='testing'):
+def get_limit(cook_url, limit_type, user, pool=None):
+    params = {'user': user}
+    if pool is not None:
+        params['pool'] = pool
+    return session.get(f'{cook_url}/{limit_type}', params=params)
+
+
+def set_limit(cook_url, limit_type, user, mem=None, cpus=None, gpus=None, count=None, reason='testing', pool=None):
+    """
+    Set resource limits for the given user.
+    The limit_type parameter should be either 'share' or 'quota', specifying which type of limit is being set.
+    Any subset of the mem, cpus, gpus and count (job-count) limits can be specified.
+    """
     limits = {}
     body = {'user': user, limit_type: limits}
-    if reason is not None: body['reason'] = reason
-    if mem is not None: limits['mem'] = mem
-    if cpus is not None: limits['cpus'] = cpus
-    if gpus is not None: limits['gpus'] = gpus
-    if jobs is not None: limits['jobs'] = jobs
+    if reason is not None:
+        body['reason'] = reason
+    if mem is not None:
+        limits['mem'] = mem
+    if cpus is not None:
+        limits['cpus'] = cpus
+    if gpus is not None:
+        limits['gpus'] = gpus
+    if count is not None:
+        limits['count'] = count
+    if pool is not None:
+        body['pool'] = pool
+    logger.debug(f'Setting {user} {limit_type} to {limits}: {body}')
     return session.post(f'{cook_url}/{limit_type}', json=body)
 
 
-def reset_limit(cook_url, limit_type, user, reason='testing'):
+def reset_limit(cook_url, limit_type, user, reason='testing', pool=None):
+    """
+    Resets resource limits for the given user to the default for the cluster.
+    The limit_type parameter should be either 'share' or 'quota', specifying which type of limit is being reset.
+    """
     params = {'user': user}
-    if reason is not None: params['reason'] = reason
+    if reason is not None:
+        params['reason'] = reason
+    if pool is not None:
+        params['pool'] = pool
     return session.delete(f'{cook_url}/{limit_type}', params=params)
 
 
@@ -891,3 +1010,38 @@ def retrieve_progress_file_env(cook_url):
     cook_settings = settings(cook_url)
     default_value = 'EXECUTOR_PROGRESS_OUTPUT_FILE'
     return get_in(cook_settings, 'executor', 'environment', 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV') or default_value
+
+
+def get_instance_stats(cook_url, **kwargs):
+    """Gets instance stats using the provided kwargs as query params"""
+    resp = session.get(f'{cook_url}/stats/instances', params=kwargs)
+    return resp.json(), resp
+
+
+def to_iso(time_millis):
+    """Converts the given time since epoch in millis to an ISO 8601 string"""
+    return datetime.utcfromtimestamp(time_millis / 1000).isoformat()
+
+
+def percentile(a, q):
+    """Returns the qth percentile of a"""
+    return numpy.percentile(a, q, interpolation='higher')
+
+
+def default_pool(cook_url):
+    """Returns the configured default pool, or None if one is not configured"""
+    cook_settings = settings(cook_url)
+    default_pool = get_in(cook_settings, 'pools', 'default')
+    return default_pool
+
+
+def all_pools(cook_url):
+    """Returns the list of all pools that exist"""
+    resp = session.get(f'{cook_url}/pools')
+    return resp.json(), resp
+
+
+def active_pools(cook_url):
+    """Returns the list of all active pools that exist"""
+    pools, resp = all_pools(cook_url)
+    return [p for p in pools if p['state'] == 'active'], resp

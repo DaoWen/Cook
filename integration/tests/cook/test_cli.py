@@ -416,7 +416,8 @@ class CookCliTest(unittest.TestCase):
     def test_list_no_matching_jobs(self):
         cp = cli.jobs(self.cook_url, '--name %s' % uuid.uuid4())
         self.assertEqual(0, cp.returncode, cp.stderr)
-        self.assertEqual(f'No jobs found in {self.cook_url}.', cli.stdout(cp))
+        self.assertIn('No running jobs', cli.stdout(cp))
+        self.assertIn(f'found in {self.cook_url}.', cli.stdout(cp))
 
     def list_jobs(self, name, user, *states):
         """Invokes the jobs subcommand with the given name, user, and state filters"""
@@ -439,23 +440,23 @@ class CookCliTest(unittest.TestCase):
         self.assertEqual(0, cp.returncode, cp.stderr)
         running_uuid = uuids[0]
 
-        # Submit a successful job
-        cp, uuids = cli.submit('ls', self.cook_url, submit_flags='--name %s' % name)
-        self.assertEqual(0, cp.returncode, cp.stderr)
-        success_uuid = uuids[0]
-
-        # Submit a failed job
-        cp, uuids = cli.submit('exit 1', self.cook_url, submit_flags='--name %s' % name)
-        self.assertEqual(0, cp.returncode, cp.stderr)
-        failed_uuid = uuids[0]
-
-        # Wait for the desired states to be reached
-        util.wait_for_job(self.cook_url, waiting_uuid, 'waiting')
-        util.wait_for_job(self.cook_url, running_uuid, 'running')
-        util.wait_for_job(self.cook_url, success_uuid, 'completed')
-        util.wait_for_job(self.cook_url, failed_uuid, 'completed')
-
         try:
+            # Submit a successful job
+            cp, uuids = cli.submit('ls', self.cook_url, submit_flags='--name %s' % name)
+            self.assertEqual(0, cp.returncode, cp.stderr)
+            success_uuid = uuids[0]
+
+            # Submit a failed job
+            cp, uuids = cli.submit('exit 1', self.cook_url, submit_flags='--name %s' % name)
+            self.assertEqual(0, cp.returncode, cp.stderr)
+            failed_uuid = uuids[0]
+
+            # Wait for the desired states to be reached
+            util.wait_for_job(self.cook_url, waiting_uuid, 'waiting')
+            util.wait_for_job(self.cook_url, running_uuid, 'running')
+            util.wait_for_job(self.cook_url, success_uuid, 'completed')
+            util.wait_for_job(self.cook_url, failed_uuid, 'completed')
+
             # waiting
             cp, jobs = self.list_jobs(name, user, 'waiting')
             self.assertEqual(0, cp.returncode, cp.stderr)
@@ -588,6 +589,19 @@ class CookCliTest(unittest.TestCase):
         self.assertEqual(0, cp.returncode, cp.stderr)
         self.assertEqual(1, len(jobs))
         self.assertIn(uuids[0], jobs[0]['uuid'])
+
+    def test_jobs_exclude_custom_executor(self):
+        # Unfortunately, there is no easy way to create a job with a custom executor.
+        # Instead, we will check that we are making a request to the correct endpoint by
+        # inspecting the --verbose output.
+        cp, jobs = cli.jobs_json(self.cook_url, '--exclude-custom-executor', flags='--verbose')
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        self.assertIn('/list', cli.decode(cp.stderr))
+        self.assertNotIn('/jobs', cli.decode(cp.stderr))
+        cp, jobs = cli.jobs_json(self.cook_url, flags='--verbose')
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        self.assertIn('/jobs', cli.decode(cp.stderr))
+        self.assertNotIn('/list', cli.decode(cp.stderr))
 
     def test_ssh_job_uuid(self):
         cp, uuids = cli.submit('ls', self.cook_url, submit_flags=f'--name {self.current_name()}')
@@ -765,6 +779,15 @@ class CookCliTest(unittest.TestCase):
         cp = cli.tail(uuids[0], 'file.txt', self.cook_url, f'--lines 1')
         self.assertEqual(0, cp.returncode, cp.stderr)
         self.assertEqual('', cli.decode(cp.stdout))
+
+    def test_tail_default_path(self):
+        text = str(uuid.uuid4())
+        cp, uuids = cli.submit(f'echo {text}', self.cook_url)
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        util.wait_for_job(self.cook_url, uuids[0], 'completed')
+        cp = cli.tail(uuids[0], '', self.cook_url)
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        self.assertIn(text, cli.decode(cp.stdout))
 
     def test_ls(self):
 
@@ -1541,8 +1564,7 @@ class CookCliTest(unittest.TestCase):
                                'mv file2.txt file.txt; done\'',
                                self.cook_url)
         self.assertEqual(0, cp.returncode, cp.stderr)
-        cp = cli.wait(uuids, self.cook_url)
-        self.assertEqual(0, cp.returncode, cp.stderr)
+        util.wait_for_job(self.cook_url, uuids[0], 'completed')
         cp = cli.cat(uuids[0], 'file.txt', self.cook_url)
         self.assertEqual(0, cp.returncode, cp.stderr)
         self.assertEqual('helloworld' * pow(2, iterations), cli.decode(cp.stdout))
@@ -1609,6 +1631,18 @@ class CookCliTest(unittest.TestCase):
         self.assertEqual(0, cp.returncode, cp.stderr)
         self.assertEqual('hello\nworld\n' * 5, cli.decode(cp.stdout))
         self.assertEqual('', cli.decode(cp.stderr))
+
+    def test_cat_binary_file(self):
+        cp, uuids = cli.submit('bash -c \''
+                               'for i in {0..255}; do num=$(printf "%x" $i); echo -n -e "\\x$num"; done > file.bin'
+                               '\'',
+                               self.cook_url)
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        cp = cli.wait(uuids, self.cook_url)
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        cp = cli.cat(uuids[0], 'file.bin', self.cook_url)
+        self.assertEqual(0, cp.returncode, cp.stderr)
+        self.assertEqual(bytes(i for i in range(0, 256)), cp.stdout)
 
     def test_usage(self):
         command = 'sleep 300'
@@ -1720,3 +1754,37 @@ class CookCliTest(unittest.TestCase):
             self.assertEqual(0, cp.returncode, cp.stderr)
             self.assertEqual(uuids[0], jobs[0]['uuid'])
             self.assertIn('Encountered connection error with bar', cli.decode(cp.stderr))
+
+    def test_submit_with_gpus(self):
+        cp, uuids = cli.submit('ls', self.cook_url, submit_flags=f'--gpus 1')
+        if util.settings(self.cook_url)['mesos-gpu-enabled']:
+            self.assertEqual(0, cp.returncode, cp.stderr)
+        else:
+            self.assertEqual(1, cp.returncode, cp.stderr)
+            self.assertIn('GPU support is not enabled', cli.stdout(cp))
+
+        cp, uuids = cli.submit('ls', self.cook_url, submit_flags=f'--gpus 0')
+        self.assertEqual(2, cp.returncode, cp.stderr)
+        self.assertIn('submit: error: argument --gpus: 0 is not a positive integer', cli.decode(cp.stderr))
+
+    def test_submit_with_pool(self):
+        pools, _ = util.all_pools(self.cook_url)
+        if len(pools) == 0:
+            self.logger.info('There are no pools to submit jobs to')
+        for pool in pools:
+            self.logger.info(f'Submitting to {pool}')
+            pool_name = pool['name']
+            cp, uuids = cli.submit('ls', self.cook_url, submit_flags=f'--pool {pool_name}')
+            if pool['state'] == 'active':
+                self.assertEqual(0, cp.returncode, cp.stderr)
+                cp, jobs = cli.show_jobs(uuids, self.cook_url)
+                self.assertEqual(0, cp.returncode, cp.stderr)
+                self.assertEqual(1, len(jobs))
+                self.assertEqual(pool_name, jobs[0]['pool'])
+            else:
+                self.assertEqual(1, cp.returncode, cp.stderr)
+                self.assertIn(f'{pool_name} is not accepting job submissions', cli.stdout(cp))
+        # Try submitting to a pool that doesn't exist
+        cp, uuids = cli.submit('ls', self.cook_url, submit_flags=f'--pool {uuid.uuid4()}')
+        self.assertEqual(1, cp.returncode, cp.stderr)
+        self.assertIn('is not a valid pool name', cli.stdout(cp))

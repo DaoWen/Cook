@@ -22,13 +22,18 @@
             [clojure.string :as str]
             [clojure.walk :refer [keywordize-keys]]
             [cook.authorization :as auth]
-            [cook.components :as components]
+            [cook.config :as config]
             [cook.impersonation :as imp]
             [cook.mesos.api :as api]
             [cook.mesos.reason :as reason]
             [cook.mesos.scheduler :as sched]
             [cook.mesos.util :as util]
-            [cook.test.testutil :refer [restore-fresh-database! create-dummy-job create-dummy-instance]]
+            [cook.test.testutil :refer [create-dummy-instance
+                                        create-dummy-job
+                                        create-dummy-job-with-instances
+                                        create-pool
+                                        flush-caches!
+                                        restore-fresh-database!]]
             [datomic.api :as d :refer [q db]]
             [mesomatic.scheduler :as msched]
             [schema.core :as s])
@@ -86,8 +91,7 @@
                        :mesos-gpu-enabled gpus-enabled
                        :task-constraints {:cpus cpus :memory-gb memory-gb :retry-limit retry-limit}}
                       (Object.)
-                      (atom true)
-                      (constantly nil))))
+                      (atom true))))
 
 (defn response->body-data [{:keys [body]}]
   (let [baos (ByteArrayOutputStream.)
@@ -187,7 +191,7 @@
                    (assoc "state" "failed" "status" "completed"))
                (first followup-read-body)))
         (is (<= 200 (:status delete-response) 299))
-        (is (= "No content." (response->body-data delete-response)))))))
+        (is (= "No content." (:body delete-response)))))))
 
 (deftest descriptive-state
   (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
@@ -349,6 +353,7 @@
         h (basic-handler conn :is-authorized-fn is-authorized-fn)
         uuid1 (str (UUID/randomUUID))
         uuid2 (str (UUID/randomUUID))
+        uuid3 (str (UUID/randomUUID))
         group-uuid (str (UUID/randomUUID))
         create-response (h {:request-method :post
                             :scheme :http
@@ -360,10 +365,21 @@
                                                          "max_retries" 42})
                                      (merge (basic-job) {"uuid" uuid2
                                                          "max_retries" 30
-                                                         "group" group-uuid})]}})
+                                                         "group" group-uuid})
+                                     (merge (basic-job) {"uuid" uuid3
+                                                         "max_retries" 10})]}})
         retry-req-attrs {:scheme :http
                          :uri "/retry"
-                         :authorization/user "mforsyth"}]
+                         :authorization/user "mforsyth"}
+        [job3 _] (create-dummy-job-with-instances conn
+                                                  :disable-mea-culpa-retries true
+                                                  :retry-count 3
+                                                  :user "mforsyth"
+                                                  :job-state :job.state/completed
+                                                  :instances [{:instance-status :instance.status/failed}
+                                                              {:instance-status :instance.status/failed}
+                                                              {:instance-status :instance.status/failed}])
+        uuid4 (str (:job/uuid (d/entity (d/db conn) job3)))]
 
     (testing "Specifying both \"job\" and \"jobs\" is malformed"
       (let [update-resp (h (merge retry-req-attrs
@@ -470,7 +486,25 @@
             read-resp (h (merge retry-req-attrs {:request-method :get
                                                  :query-params {:job uuid2}}))
             read-body (response->body-data read-resp)]
-        (is (= read-body 36))))))
+        (is (= read-body 36))))
+
+    (testing "conflict on retrying completed jobs"
+      (let [update-resp (h (merge retry-req-attrs
+                                  {:request-method :post
+                                   :body-params {"jobs" [uuid1 uuid4]
+                                                 "retries" 3}}))]
+        (is (= 409 (:status update-resp)))
+        (is (= {"error" (str "Jobs will not retry: " uuid4)}
+               (response->body-data update-resp)))))
+
+    (testing "conflict on retrying waiting jobs"
+      (let [update-resp (h (merge retry-req-attrs
+                                  {:request-method :post
+                                   :body-params {"jobs" [uuid3]
+                                                 "retries" 10}}))]
+        (is (= 409 (:status update-resp)))
+        (is (= {"error" (str "Jobs will not retry: " uuid3)}
+               (response->body-data update-resp)))))))
 
 (deftest instance-cancelling
   (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")]
@@ -495,7 +529,7 @@
         (is (not initial-instance-cancelled?))
         (is (<= 200 (:status cancel-resp) 299))
         (is (= "application/json" (get-in cancel-resp [:headers "Content-Type"])))
-        (is (= "No content." (response->body-data cancel-resp)))
+        (is (= "No content." (:body cancel-resp)))
         (is followup-instance-cancelled?)))
 
     (testing "set cancelled on completed instance"
@@ -519,13 +553,13 @@
         (is (not initial-instance-cancelled?))
         (is (<= 200 (:status cancel-resp) 299))
         (is (= "application/json" (get-in cancel-resp [:headers "Content-Type"])))
-        (is (= "No content." (response->body-data cancel-resp)))
+        (is (= "No content." (:body cancel-resp)))
         (is followup-instance-cancelled?)))))
 
 
 (deftest quota-api
   (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
-        h (basic-handler conn)
+        h (basic-handler conn :gpus-enabled true)
         quota-req-attrs {:scheme :http
                          :uri "/quota"
                          :authorization/user "mforsyth"
@@ -553,6 +587,22 @@
                                 :query-params {:user "foo"}}))
             get-body (response->body-data get-resp)]
         (is (= get-body update-body))))
+
+    (testing "gpu quota is checked on job submission"
+      (let [job (assoc (basic-job) "gpus" 3.0)
+            job-resp (h (merge quota-req-attrs
+                               {:uri "/rawscheduler"
+                                :authorization/user "foo"
+                                :request-method :post
+                                :body-params {"jobs" [job]}}))]
+        (is (<= 200 (:status job-resp) 299)))
+      (let [job (assoc (basic-job) "gpus" 4.0)
+            job-resp (h (merge quota-req-attrs
+                               {:uri "/rawscheduler"
+                                :authorization/user "foo"
+                                :request-method :post
+                                :body-params {"jobs" [job]}}))]
+        (is (= 422 (:status job-resp)))))
 
     (testing "delete resets quota"
       (let [delete-resp (h (merge quota-req-attrs
@@ -1125,8 +1175,8 @@
         (is (thrown? Exception (s/validate api/Job (assoc min-job :expected-runtime 3 :max-runtime 2))))))))
 
 (deftest test-create-jobs!
-  (let [retrieve-sandbox-directory-from-agent (constantly nil)
-        expected-job-map
+  (cook.test.testutil/flush-caches!)
+  (let [expected-job-map
         (fn
           ; Converts the provided job and framework-id (framework-id) to the job-map we expect to get back from
           ; api/fetch-job-map. Note that we don't include the submit_time field here, so assertions below
@@ -1183,7 +1233,7 @@
                                       {:resource/type :resource.type/mem
                                        :resource/amount (:mem job)}]}
               _ @(d/transact conn [job-ent])
-              job-resp (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)]
+              job-resp (api/fetch-job-map (db conn) framework-id uuid)]
           (is (= (expected-job-map job framework-id)
                  (dissoc job-resp :submit_time)))
           (s/validate api/JobResponseDeprecated
@@ -1197,8 +1247,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job framework-id)
-                 (-> (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)
-                     (dissoc :submit_time))))))
+                 (dissoc (api/fetch-job-map (db conn) framework-id uuid) :submit_time)))))
 
       (testing "should fail on a duplicate uuid"
         (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
@@ -1217,8 +1266,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job framework-id)
-                 (-> (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)
-                     (dissoc :submit_time))))))
+                 (dissoc (api/fetch-job-map (db conn) framework-id uuid) :submit_time)))))
 
       (testing "should work when the job specifies the expected runtime"
         (let [conn (restore-fresh-database! "datomic:mem://mesos-api-test")
@@ -1227,7 +1275,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job framework-id)
-                 (-> (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)
+                 (-> (api/fetch-job-map (db conn) framework-id uuid)
                      (dissoc :submit_time))))))
 
       (testing "should work when the job specifies disable-mea-culpa-retries"
@@ -1237,7 +1285,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job framework-id)
-                 (-> (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)
+                 (-> (api/fetch-job-map (db conn) framework-id uuid)
                      (dissoc :submit_time))))))
 
       (testing "should work when the job specifies cook-executor"
@@ -1247,7 +1295,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job framework-id)
-                 (-> (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)
+                 (-> (api/fetch-job-map (db conn) framework-id uuid)
                      (dissoc :submit_time)
                      (update :executor name))))))
 
@@ -1258,7 +1306,7 @@
           (is (= {::api/results (str "submitted jobs " uuid)}
                  (api/create-jobs! conn {::api/jobs [job]})))
           (is (= (expected-job-map job framework-id)
-                 (-> (api/fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent uuid)
+                 (-> (api/fetch-job-map (db conn) framework-id uuid)
                      (dissoc :submit_time)
                      (update :executor name)))))))))
 
@@ -1309,7 +1357,7 @@
   (let [socket (ServerSocket.)]
     (is (= {:foo (str socket)} (api/stringify {:foo socket})))
     (.close socket))
-  (let [settings (components/config-settings (minimal-config))]
+  (let [settings (config/config-settings (minimal-config))]
     (is (thrown? JsonGenerationException (cheshire/generate-string settings)))
     (is (cheshire/generate-string (api/stringify settings)))))
 
@@ -1361,8 +1409,9 @@
                                            :data (ByteString/copyFrom (.getBytes (pr-str {:percent progress}) "UTF-8"))}]
                                  task))
           job-id (create-dummy-job conn :user "user" :job-state :job.state/running)
+          sync-agent-sandboxes-fn (constantly true)
           send-status-update #(->> (make-status-update "task1" :unknown :task-running %)
-                                   (sched/handle-status-update conn driver fenzo)
+                                   (sched/handle-status-update conn driver fenzo sync-agent-sandboxes-fn)
                                    async/<!!)
           instance-id (create-dummy-instance conn job-id
                                              :instance-status :instance.status/running
@@ -1373,7 +1422,7 @@
                                          [?i :instance/progress ?p]]
                                        (db conn) instance-id))
           job-uuid (:job/uuid (d/entity (db conn) job-id))
-          progress-from-api #(:progress (first (:instances (api/fetch-job-map (db conn) nil (constantly nil) job-uuid))))]
+          progress-from-api #(:progress (first (:instances (api/fetch-job-map (db conn) nil job-uuid))))]
       (send-status-update 0)
       (is (= 0 (progress-from-db)))
       (is (= 0 (progress-from-api)))
@@ -1389,23 +1438,21 @@
 
 (deftest test-fetch-instance-map
   (let [conn (restore-fresh-database! "datomic:mem://test-fetch-instance-map")]
-    (let [basic-instance-properties (fn [job-entity-id]
-                                      {:executor-id (str job-entity-id "-executor-1")
-                                       :slave-id "slave-1"
-                                       :task-id (str job-entity-id "-executor-1")})
-          basic-instance-map (fn [job-entity-id]
-                               {:executor_id (str job-entity-id "-executor-1")
-                                :slave_id "slave-1"
-                                :task_id (str job-entity-id "-executor-1")})]
+    (let [job-entity-id (create-dummy-job conn :user "test-user" :job-state :job.state/completed)
+          basic-instance-properties {:executor-id (str job-entity-id "-executor-1")
+                                     :slave-id "slave-1"
+                                     :task-id (str job-entity-id "-executor-1")}
+          basic-instance-map {:executor_id (str job-entity-id "-executor-1")
+                              :slave_id "slave-1"
+                              :task_id (str job-entity-id "-executor-1")}]
 
       (testing "basic-instance-without-sandbox"
-        (let [job-entity-id (create-dummy-job conn :user "test-user" :job-state :job.state/completed)
-              instance-entity-id (apply create-dummy-instance conn job-entity-id
+        (let [instance-entity-id (apply create-dummy-instance conn job-entity-id
                                         :instance-status :instance.status/success
-                                        (mapcat seq (basic-instance-properties job-entity-id)))
+                                        (mapcat seq basic-instance-properties))
               instance-entity (d/entity (db conn) instance-entity-id)
-              instance-map (api/fetch-instance-map (db conn) instance-entity (constantly nil))
-              expected-map (assoc (basic-instance-map job-entity-id)
+              instance-map (api/fetch-instance-map (db conn) instance-entity)
+              expected-map (assoc basic-instance-map
                              :backfilled false
                              :hostname "localhost"
                              :ports []
@@ -1414,15 +1461,14 @@
                              :status "success")]
           (is (= expected-map (dissoc instance-map :start_time)))))
 
-      (testing "basic-instance-with-sandbox-url-from-datomic"
-        (let [job-entity-id (create-dummy-job conn :user "test-user" :job-state :job.state/completed)
-              instance-entity-id (apply create-dummy-instance conn job-entity-id
+      (testing "basic-instance-with-sandbox-url"
+        (let [instance-entity-id (apply create-dummy-instance conn job-entity-id
                                         :instance-status :instance.status/success
                                         :sandbox-directory "/path/to/working/directory"
-                                        (mapcat seq (basic-instance-properties job-entity-id)))
+                                        (mapcat seq basic-instance-properties))
               instance-entity (d/entity (db conn) instance-entity-id)
-              instance-map (api/fetch-instance-map (db conn) instance-entity (constantly nil))
-              expected-map (assoc (basic-instance-map job-entity-id)
+              instance-map (api/fetch-instance-map (db conn) instance-entity)
+              expected-map (assoc basic-instance-map
                              :backfilled false
                              :hostname "localhost"
                              :output_url "http://localhost:5051/files/read.json?path=%2Fpath%2Fto%2Fworking%2Fdirectory"
@@ -1433,28 +1479,8 @@
                              :status "success")]
           (is (= expected-map (dissoc instance-map :start_time)))))
 
-      (testing "basic-instance-with-sandbox-url-from-agent"
-        (let [job-entity-id (create-dummy-job conn :user "test-user" :job-state :job.state/completed)
-              instance-entity-id (apply create-dummy-instance conn job-entity-id
-                                        :instance-status :instance.status/success
-                                        (mapcat seq (basic-instance-properties job-entity-id)))
-              instance-entity (d/entity (db conn) instance-entity-id)
-              retrieve-sandbox-directory-from-agent (constantly "/sandbox/directory")
-              instance-map (api/fetch-instance-map (db conn) instance-entity retrieve-sandbox-directory-from-agent)
-              expected-map (assoc (basic-instance-map job-entity-id)
-                             :backfilled false
-                             :hostname "localhost"
-                             :output_url "http://localhost:5051/files/read.json?path=%2Fsandbox%2Fdirectory"
-                             :ports []
-                             :preempted false
-                             :progress 0
-                             :sandbox_directory "/sandbox/directory"
-                             :status "success")]
-          (is (= expected-map (dissoc instance-map :start_time)))))
-
       (testing "detailed-instance"
-        (let [job-entity-id (create-dummy-job conn :user "test-user" :job-state :job.state/completed)
-              instance-entity-id (apply create-dummy-instance conn job-entity-id
+        (let [instance-entity-id (apply create-dummy-instance conn job-entity-id
                                         :exit-code 2
                                         :hostname "agent-hostname"
                                         :instance-status :instance.status/success
@@ -1463,10 +1489,10 @@
                                         :progress-message "seventy-eight percent done"
                                         :reason :preempted-by-rebalancer
                                         :sandbox-directory "/path/to/working/directory"
-                                        (mapcat seq (basic-instance-properties job-entity-id)))
+                                        (mapcat seq basic-instance-properties))
               instance-entity (d/entity (db conn) instance-entity-id)
-              instance-map (api/fetch-instance-map (db conn) instance-entity (constantly nil))
-              expected-map (assoc (basic-instance-map job-entity-id)
+              instance-map (api/fetch-instance-map (db conn) instance-entity)
+              expected-map (assoc basic-instance-map
                              :backfilled false
                              :exit_code 2
                              :hostname "agent-hostname"
@@ -1528,6 +1554,33 @@
     (is (= 201 (:status (submit-job handler "alice" "carol"))))
     (is (= 403 (:status (submit-job handler "bob" "carol"))))))
 
+(defn list-jobs-with-list
+  "Simulates a call to the /list endpoint with the given query params"
+  [handler user state start-ms end-ms include-custom-executor?]
+  (response->body-data (handler {:request-method :get
+                                 :scheme :http
+                                 :uri "/list"
+                                 :authorization/user "user"
+                                 :query-params {"user" user
+                                                "state" state
+                                                "start-ms" (str start-ms)
+                                                "end-ms" (str end-ms)
+                                                "include-custom-executor" (str include-custom-executor?)}})))
+
+(defn list-jobs-with-jobs
+  "Simulates a call to the /jobs endpoint with the given query params"
+  [handler user states start-ms end-ms]
+  (let [response (handler {:request-method :get
+                           :scheme :http
+                           :uri "/jobs"
+                           :authorization/user "user"
+                           :query-params {"user" user
+                                          "state" states
+                                          "start" (str start-ms)
+                                          "end" (str end-ms)}})]
+    (is (= 200 (:status response)))
+    (response->body-data response)))
+
 (deftest test-list-jobs-by-time
   (let [conn (restore-fresh-database! "datomic:mem://test-list-jobs")
         handler (basic-handler conn)
@@ -1537,14 +1590,7 @@
                                                                        :authorization/user "user"
                                                                        :query-params {"job" %}})))
                                  "submit_time")
-        list-jobs-fn #(response->body-data (handler {:request-method :get
-                                                     :scheme :http
-                                                     :uri "/list"
-                                                     :authorization/user "user"
-                                                     :query-params {"user" "user"
-                                                                    "state" "running+waiting+completed"
-                                                                    "start-ms" (str %1)
-                                                                    "end-ms" (str %2)}}))
+        list-jobs-fn #(list-jobs-with-list handler "user" "running+waiting+completed" %1 %2 nil)
         response-1 (submit-job handler "user")
         _ (is (= 201 (:status response-1)))
         _ (Thread/sleep 10)
@@ -1558,6 +1604,29 @@
     (is (= (:uuid response-2) (get (first (list-jobs-fn (inc submit-ms-1) (inc submit-ms-2))) "uuid")))
     (is (= (:uuid response-2) (get (first (list-jobs-fn submit-ms-1 (inc submit-ms-2))) "uuid")))
     (is (= (:uuid response-1) (get (second (list-jobs-fn submit-ms-1 (inc submit-ms-2))) "uuid")))))
+
+(deftest test-list-jobs-include-custom-executor
+  (let [conn (restore-fresh-database! "datomic:mem://test-list-jobs-include-custom-executor")
+        handler (basic-handler conn)
+        before (t/now)
+        list-jobs-fn #(list-jobs-with-jobs handler "user" ["running" "waiting" "completed"]
+                                           (.getMillis before) (+ 1 (.getMillis (t/now))))
+        response-1 (submit-job handler "user")
+        response-2 (submit-job handler "user")
+        _ @(d/transact conn [[:db/add [:job/uuid (UUID/fromString (:uuid response-1))] :job/custom-executor true]])
+        jobs (list-jobs-fn)]
+    (is (= 201 (:status response-2)))
+    (is (= 201 (:status response-1)))
+    (is (= 2 (count jobs)))
+    (is (= (:uuid response-2) (-> jobs first (get "uuid"))))
+    (is (= (:uuid response-1) (-> jobs second (get "uuid"))))
+    (is (-> (d/entity (d/db conn) [:job/uuid (UUID/fromString (:uuid response-1))])
+            d/touch
+            :job/custom-executor))
+    (is (-> (d/entity (d/db conn) [:job/uuid (UUID/fromString (:uuid response-2))])
+            d/touch
+            :job/custom-executor
+            not))))
 
 (deftest test-name-filter-str->name-filter-pattern
   (is (= (str #".*") (str (api/name-filter-str->name-filter-pattern "***"))))
@@ -1593,8 +1662,168 @@
     @(d/transact conn [job-txn-no-name])
     (let [db (db conn)
           job-entity (d/entity db [:job/uuid job-uuid])
-          job-map-for-api (api/fetch-job-map db nil nil job-uuid)]
+          job-map-for-api (api/fetch-job-map db nil job-uuid)]
       (is (= job-uuid (:job/uuid job-entity)))
       (is (nil? (:job/name job-entity)))
       (is (= job-uuid (:uuid job-map-for-api)))
       (is (= "cookjob" (:name job-map-for-api))))))
+
+(deftest test-get-user-usage-no-usage
+  (let [conn (restore-fresh-database! "datomic:mem://test-get-user-usage")
+        request-context {:request {:query-params {:user "alice"}}}]
+    (is (= {:total-usage {:cpus 0.0
+                          :mem 0.0
+                          :gpus 0.0
+                          :jobs 0}}
+           (api/get-user-usage (d/db conn) request-context)))
+
+    (create-pool conn "foo")
+    (create-pool conn "bar")
+    (create-pool conn "baz")
+    (is (= {:total-usage {:cpus 0.0
+                          :mem 0.0
+                          :gpus 0.0
+                          :jobs 0}
+            :pools {"foo" {:total-usage {:cpus 0.0
+                                         :mem 0.0
+                                         :gpus 0.0
+                                         :jobs 0}}
+                    "bar" {:total-usage {:cpus 0.0
+                                         :mem 0.0
+                                         :gpus 0.0
+                                         :jobs 0}}
+                    "baz" {:total-usage {:cpus 0.0
+                                         :mem 0.0
+                                         :gpus 0.0
+                                         :jobs 0}}}}
+           (api/get-user-usage (d/db conn) request-context)))))
+
+(deftest test-get-user-usage-with-some-usage
+  (let [conn (restore-fresh-database! "datomic:mem://test-get-user-usage-with-some-usage")
+        request-context {:request {:query-params {:user "alice"}}}]
+    ; No pools in the database
+    (create-dummy-job conn
+                      :user "alice"
+                      :job-state :job.state/running
+                      :ncpus 12
+                      :memory 34
+                      :gpus 56)
+    (is (= {:total-usage {:cpus 12.0
+                          :mem 34.0
+                          :gpus 56.0
+                          :jobs 1}}
+           (api/get-user-usage (d/db conn) request-context)))
+
+    ; Jobs with no pool should show up in the default pool
+    (create-pool conn "foo")
+    (create-pool conn "bar")
+    (create-pool conn "baz")
+    (is (= {:total-usage {:cpus 12.0
+                          :mem 34.0
+                          :gpus 56.0
+                          :jobs 1}
+            :pools {"foo" {:total-usage {:cpus 0.0
+                                         :mem 0.0
+                                         :gpus 0.0
+                                         :jobs 0}}
+                    "bar" {:total-usage {:cpus 12.0
+                                         :mem 34.0
+                                         :gpus 56.0
+                                         :jobs 1}}
+                    "baz" {:total-usage {:cpus 0.0
+                                         :mem 0.0
+                                         :gpus 0.0
+                                         :jobs 0}}}}
+           (with-redefs [config/default-pool (constantly "bar")]
+             (api/get-user-usage (d/db conn) request-context))))
+
+    ; Jobs with a pool should show up in that pool
+    (create-dummy-job conn
+                      :user "alice"
+                      :job-state :job.state/running
+                      :ncpus 78
+                      :memory 910
+                      :gpus 1112
+                      :pool "baz")
+    (is (= {:total-usage {:cpus 12.0
+                          :mem 34.0
+                          :gpus 56.0
+                          :jobs 1}
+            :pools {"foo" {:total-usage {:cpus 12.0
+                                         :mem 34.0
+                                         :gpus 56.0
+                                         :jobs 1}}
+                    "bar" {:total-usage {:cpus 0.0
+                                         :mem 0.0
+                                         :gpus 0.0
+                                         :jobs 0}}
+                    "baz" {:total-usage {:cpus 78.0
+                                         :mem 910.0
+                                         :gpus 1112.0
+                                         :jobs 1}}}}
+           (with-redefs [config/default-pool (constantly "foo")]
+             (api/get-user-usage (d/db conn) request-context))))
+
+    ; Asking for a specific pool should return that pool's
+    ; usage at the top level, and should not produce sub-map
+    (create-dummy-job conn
+                      :user "alice"
+                      :job-state :job.state/running
+                      :ncpus 13
+                      :memory 14
+                      :gpus 15
+                      :pool "bar")
+    (with-redefs [config/default-pool (constantly "baz")]
+      (is (= {:total-usage {:cpus 0.0
+                            :mem 0.0
+                            :gpus 0.0
+                            :jobs 0}}
+             (api/get-user-usage (d/db conn) (assoc-in request-context [:request :query-params :pool] "foo"))))
+      (is (= {:total-usage {:cpus 13.0
+                            :mem 14.0
+                            :gpus 15.0
+                            :jobs 1}}
+             (api/get-user-usage (d/db conn) (assoc-in request-context [:request :query-params :pool] "bar"))))
+      (is (= {:total-usage {:cpus 90.0
+                            :mem 944.0
+                            :gpus 1168.0
+                            :jobs 2}}
+             (api/get-user-usage (d/db conn) (assoc-in request-context [:request :query-params :pool] "baz")))))))
+
+(deftest test-create-jobs-handler
+  (let [conn (restore-fresh-database! "datomic:mem://test-create-jobs-handler")
+        task-constraints {:cpus 12 :memory-gb 100 :retry-limit 200}
+        gpu-enabled? false
+        is-authorized-fn (constantly true)
+        new-request (fn []
+                      {:request-method :post
+                       :scheme :http
+                       :uri "/rawscheduler"
+                       :headers {"Content-Type" "application/json"}
+                       :body-params {"jobs" [(basic-job)]}})]
+    (with-redefs [api/no-job-exceeds-quota? (constantly true)]
+      (testing "successful-job-creation-response"
+        (with-redefs [api/create-jobs! (fn [in-conn _]
+                                         (is (= conn in-conn)))]
+          (let [handler (api/create-jobs-handler conn task-constraints gpu-enabled? is-authorized-fn)
+                {:keys [status]} (handler (new-request))]
+            (is (= 201 status)))))
+
+      (testing "transaction-timed-out-job-creation-response"
+        (with-redefs [api/create-jobs! (fn [in-conn _]
+                                         (is (= conn in-conn))
+                                         (throw (ex-info "Transaction timed out."
+                                                         {:db.error :db.error/transaction-timeout})))]
+          (let [handler (api/create-jobs-handler conn task-constraints gpu-enabled? is-authorized-fn)
+                {:keys [body status]} (handler (new-request))]
+            (is (= 500 status))
+            (is (str/includes? body "Transaction timed out. Your jobs may not have been created successfully.")))))
+
+      (testing "generic-exception-job-creation-response"
+        (with-redefs [api/create-jobs! (fn [in-conn _]
+                                         (is (= conn in-conn))
+                                         (throw (Exception. "Thrown from test")))]
+          (let [handler (api/create-jobs-handler conn task-constraints gpu-enabled? is-authorized-fn)
+                {:keys [body status]} (handler (new-request))]
+            (is (= 500 status))
+            (is (str/includes? body "Exception occurred while creating job - Thrown from test"))))))))

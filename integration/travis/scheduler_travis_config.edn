@@ -1,4 +1,8 @@
 {:port #config/env-int "COOK_PORT"
+ :ssl {:port #config/env-int "COOK_SSL_PORT"
+       :keystore-path #config/env "COOK_KEYSTORE_PATH"
+       :keystore-type "pkcs12"
+       :keystore-pass "cookstore"}
  :hostname "172.17.0.1"
  :authorization {;; Note that internally, Cook will select :http-basic if it's set to true,
                  ;; and fall back to :one-user only if :http-basic is false.
@@ -12,6 +16,7 @@
                         :admins #{"root" "travis"}
                         ;; users that are allowed to do things on behalf of others
                         :impersonators #{"poser" "travis"}}
+ :cors-origins ["https?://cors.example.com"]
  :database {:datomic-uri #config/env "COOK_DATOMIC"}
  :zookeeper {:connection #config/env "COOK_ZOOKEEPER"
              :local? #config/env-bool "COOK_ZOOKEEPER_LOCAL"
@@ -21,7 +26,7 @@
                                 :timeout-interval-minutes 1
                                 :memory-gb 48
                                 :retry-limit 200
-                                :cpus 6}}
+                                :cpus 10}}
  :rate-limit {:user-limit-per-m 1000000}
  :rebalancer {:dru-scale 1}
  :mesos {:master #config/env "MINIMESOS_ZOOKEEPER"
@@ -34,6 +39,7 @@
             :environment {"EXECUTOR_DEFAULT_PROGRESS_OUTPUT_NAME" "stdout"}
             :portion #config/env-int-default ["COOK_EXECUTOR_PORTION" 0]}
  :agent-query-cache {:ttl-ms 1000}
+ :sandbox-syncer {:sync-interval-ms 1000}
  :unhandled-exceptions {:log-level :error}
  :metrics {:jmx true}
  :nrepl {:enabled? false}
@@ -43,4 +49,5 @@
                 "datomic.kv-cluster" :warn
                 "cook.mesos.rebalancer" :debug
                 "cook.mesos.scheduler" :debug
-                :default :info}}}
+                :default :info}}
+ :pools {:default #config/env "COOK_DEFAULT_POOL"}}

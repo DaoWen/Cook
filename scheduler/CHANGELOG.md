@@ -4,6 +4,69 @@ All notable changes to this project will be documented in this file
  
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.16.0] - 2018-05-08
+### Added
+- Added pool support to /share and /quota endpoints, from @pschorf
+### Changed
+- Returns 409 on some retry operations instead of retrying jobs which could end up in a bad state, from @pschorf
+- Fixed bug with disable_mea_culpa_retries, from @pschorf
+- Improved logging for some error cases, from @dposada
+
+
+## [1.15.0] - 2018-04-17
+### Added
+- Support for pool param to /usage endpoint, from @dposada
+- Support for pool param on job submission, from @dposada
+- Support for SSL, from @pschorf
+- Support for api-only mode, from @dposada
+### Fixed
+- Issue where monitor metrics would sometimes stop on a non-zero value, from @dposada
+
+## [1.14.1] - 2018-03-29
+### Fixed
+- Fix performance regression in list API, from @scrosby
+
+## [1.14.0] - 2018-03-28
+### Added
+- Support for listing custom executor jobs in /jobs endpoint, from @dposada
+- Kill instances for cancelled jobs on leadership election, from @pschorf
+### Changed
+- Performance improvements to scheduling and list APIs, from @scrosby
+### Fixed
+- Fixed GPU support, from @dPeS
+
+## [1.13.0] - 2018-03-13
+### Added
+- Support for CORS requests, from @pschorf
+- Scheduling performance improvements, from @scrosby
+- Counters for job cpu/mem/runtime by failure reason, from @dposada 
+
+## [1.12.0] - 2018-03-05
+### Added
+- Endpoint for instance statistics, from @dposada
+- Support for a configurable run as user, from @shamsimam
+- Support for configuring number of instances which can fail before falling back to the mesos executor, from @shamsimam
+### Changed
+- Performance improvements to sandbox syncer, from @shamsimam
+- Rebalancer now reserve hosts after preempting, from @pschorf
+- Performance improvents to dru computation, @shamsimam
+
+## [1.11.0] - 2018-02-05
+### Added
+- Added timely sandbox directory updates for tasks that are not executed by the cook executor, from @shamsimam
+- Added environment variables that contain the resources requested by the job, from @shamsimam
+### Changed
+- Converted monitor Riemann events to codahale metrics, from @dposada
+### Fixed
+- Fixed string encoding on `/rawscheduler` POST, from @pschorf
+- The `start-time` timestamp on `/info` no longer re-evaluates to `now` on each request, from @DaoWen
+
+## [1.10.0] - 2018-01-22
+### Added
+- Added user-impersonation functionality to support services running on top of Cook Scheduler, from @DaoWen
+### Changed
+- Jobs that exceed a user's total resource quota are rejected rather than waiting indefinitely, from @DaoWen
+
 ## [1.9.0] - 2018-01-10
 ### Added
 - Added unauthenticated /info endpoint for retrieving basic setup information, from @DaoWen

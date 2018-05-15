@@ -19,6 +19,8 @@
             [clj-time.core :as time]
             [clj-time.periodic :as periodic]
             [clojure.core.cache :as cache]
+            [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
             [datomic.api :as d]
             [metrics.counters :as counters]
@@ -28,11 +30,14 @@
 
 (def sandbox-aggregator-message-rate (meters/meter ["cook-mesos" "scheduler" "sandbox-aggregator-message-rate"]))
 (def sandbox-aggregator-pending-count (counters/counter ["cook-mesos" "scheduler" "sandbox-aggregator-pending-count"]))
+(def sandbox-pending-sync-host-count (counters/counter ["cook-mesos" "scheduler" "sandbox-pending-sync-host-count"]))
 (def sandbox-updater-pending-entries (histograms/histogram ["cook-mesos" "scheduler" "sandbox-updater-pending-entries"]))
 (def sandbox-updater-publish-duration (timers/timer ["cook-mesos" "scheduler" "sandbox-updater-publish-duration"]))
 (def sandbox-updater-publish-rate (meters/meter ["cook-mesos" "scheduler" "sandbox-updater-publish-rate"]))
 (def sandbox-updater-tx-duration (timers/timer ["cook-mesos" "scheduler" "sandbox-updater-tx-duration"]))
 (def sandbox-updater-tx-rate (meters/meter ["cook-mesos" "scheduler" "sandbox-updater-tx-rate"]))
+(def sandbox-updater-unprocessed-count (counters/counter ["cook-mesos" "scheduler" "sandbox-updater-unprocessed-count"]))
+(def sandbox-updater-unprocessed-entries (histograms/histogram ["cook-mesos" "scheduler" "sandbox-updater-unprocessed-entries"]))
 
 (defn agent->task-id->sandbox
   "Returns the sandbox in the current agent state."
@@ -120,48 +125,138 @@
                 [id directory]))
          (into {}))))
 
+(defn- update-pending-sync-host-counter!
+  "Updates the sandbox-pending-sync-host-count to the number of pending sync hosts and returns the input."
+  [{:keys [pending-sync-hosts] :as pending-sync-state}]
+  (counters/clear! sandbox-pending-sync-host-count)
+  (when (seq pending-sync-hosts)
+    (counters/inc! sandbox-pending-sync-host-count (count pending-sync-hosts)))
+  pending-sync-state)
+
+(defn- aggregate-pending-sync-hostname
+  "Aggregates the hostname as a pending sync item into pending-sync-state.
+   It also updates host->consecutive-failures if the reason is :error."
+  [pending-sync-state hostname reason]
+  (update-pending-sync-host-counter!
+    (cond-> (update pending-sync-state :pending-sync-hosts conj hostname)
+            (= :error reason)
+            (update-in [:host->consecutive-failures hostname] (fnil inc 0)))))
+
+(defn- clear-pending-sync-hostname
+  "Clears the hostname as a pending sync item from pending-sync-state.
+   It also clears the entry from host->consecutive-failures if the reason is :success or :threshold."
+  [pending-sync-state hostname reason]
+  (update-pending-sync-host-counter!
+    (cond-> (update pending-sync-state :pending-sync-hosts disj hostname)
+            (contains? #{:success :threshold} reason)
+            (update :host->consecutive-failures dissoc hostname))))
+
+(defn- aggregate-unprocessed-task-ids!
+  "Aggregates the unprocessed task-id into the unprocessed-host->task-ids-atom for a given host."
+  [unprocessed-host->task-ids-atom host task-id]
+  (swap! unprocessed-host->task-ids-atom
+         (fn [unprocessed-host->task-ids-in-atom]
+           (let [unprocessed-task-ids (get unprocessed-host->task-ids-in-atom host #{})]
+             (if-not (contains? unprocessed-task-ids task-id)
+               (do
+                 (counters/inc! sandbox-updater-unprocessed-count)
+                 (->> task-id
+                      (conj unprocessed-task-ids)
+                      (assoc unprocessed-host->task-ids-in-atom host)))
+               unprocessed-host->task-ids-in-atom))))
+  (histograms/update! sandbox-updater-unprocessed-entries (counters/value sandbox-updater-unprocessed-count)))
+
+(defn- remove-processed-task-ids!
+  "Removes the processed-task-ids from the unprocessed-host->task-ids-atom for a given host."
+  [unprocessed-host->task-ids-atom host task-ids]
+  (swap! unprocessed-host->task-ids-atom
+         (fn [unprocessed-host->task-ids-in-atom]
+           (let [unprocessed-task-ids (get unprocessed-host->task-ids-in-atom host #{})
+                 unprocessed-task-ids' (set/difference unprocessed-task-ids task-ids)]
+             (if (not= unprocessed-task-ids unprocessed-task-ids')
+               (do
+                 (->> (- (count unprocessed-task-ids') (count unprocessed-task-ids))
+                      (counters/inc! sandbox-updater-unprocessed-count))
+                 (if (seq unprocessed-task-ids')
+                   (assoc unprocessed-host->task-ids-in-atom host unprocessed-task-ids')
+                   (dissoc unprocessed-host->task-ids-in-atom host)))
+               unprocessed-host->task-ids-in-atom))))
+  (histograms/update! sandbox-updater-unprocessed-entries (counters/value sandbox-updater-unprocessed-count)))
+
+(defn- process-task-id->sandbox-directory-on-host
+  "Processes the result of the indexed task-id->sandbox-directory on a host.
+   First, the tasks which have pending sandbox directory requests are filtered based on existing requests.
+   The filtered version of tasks without sandbox directories is then synced into the task-id->sandbox-agent."
+  [{:keys [task-id->sandbox-agent unprocessed-host->task-ids-atom]} host unprocessed-task-ids-prev task-id->sandbox-directory]
+  (let [filtered-task-id->sandbox-directory (->> (get @unprocessed-host->task-ids-atom host)
+                                                 (set/union unprocessed-task-ids-prev)
+                                                 (select-keys task-id->sandbox-directory))
+        filtered-task-ids (->> filtered-task-id->sandbox-directory
+                               keys
+                               set)]
+    (log/info "Found" (count task-id->sandbox-directory) "task(s) on" host "of which"
+              (count filtered-task-id->sandbox-directory) "are task(s) with sandbox directory requests")
+    (when-let [missing-task-ids (seq (set/difference unprocessed-task-ids-prev filtered-task-ids))]
+      (log/info "No sandbox directories found on" host "for" (count missing-task-ids) "requested task(s):"
+                (str/join "," missing-task-ids)))
+    (->> (set/union unprocessed-task-ids-prev filtered-task-ids)
+         (remove-processed-task-ids! unprocessed-host->task-ids-atom host))
+    (send task-id->sandbox-agent aggregate-sandbox filtered-task-id->sandbox-directory)))
+
 (defn refresh-agent-cache-entry
   "If the entry for the specified agent is not cached:
-   triggers building an indexed version of all task-id to sandbox directory for the specified agent.
-   The function call is a no-op if the specified agent already exists in the cache."
-  [{:keys [mesos-agent-query-cache]} framework-id hostname]
+   - Triggers building an indexed version of all task-id to sandbox directory for the specified agent;
+   - After the indexed version is built, the tasks which have pending sandbox directory requests are filtered;
+   - The filtered version of tasks without sandbox directories is then synced into the task-id->sandbox-agent.
+   If the specified agent already exists in the cache, only the task-id is inserted into the
+   unprocessed-host->task-ids-atom to be processed in the future."
+  [{:keys [mesos-agent-query-cache pending-sync-agent unprocessed-host->task-ids-atom] :as publisher-state}
+   framework-id host task-id]
   (try
-    (let [run (delay
+    (when task-id
+      (aggregate-unprocessed-task-ids! unprocessed-host->task-ids-atom host task-id))
+    (let [unprocessed-task-ids (get @unprocessed-host->task-ids-atom host)
+          run (delay
                 (try
-                  (let [task-id->sandbox-directory (retrieve-sandbox-directories-on-agent framework-id hostname)]
-                    (log/info "Found" (count task-id->sandbox-directory) "tasks without sandbox directories on" hostname)
-                    {:result :success
-                     :data task-id->sandbox-directory})
+                  (let [task-id->sandbox-directory (retrieve-sandbox-directories-on-agent framework-id host)]
+                    (process-task-id->sandbox-directory-on-host
+                      publisher-state host unprocessed-task-ids task-id->sandbox-directory)
+                    (send pending-sync-agent clear-pending-sync-hostname host :success)
+                    (when-let [unprocessed-task-ids-new (get @unprocessed-host->task-ids-atom host)]
+                      (log/info host "has" (count unprocessed-task-ids-new) "pending tasks even after a state lookup")
+                      (send pending-sync-agent aggregate-pending-sync-hostname host :pending))
+                    :success)
                   (catch Exception e
-                    (log/error e "Failed to get mesos agent state on" hostname)
-                    {:result :error})))
+                    (log/error e "Failed to get mesos agent state on" host)
+                    (send pending-sync-agent aggregate-pending-sync-hostname host :error)
+                    :error)))
           cs (swap! mesos-agent-query-cache
                     (fn mesos-agent-query-cache-swap-fn [c]
-                      (if (cache/has? c hostname)
-                        (cache/hit c hostname)
-                        (cache/miss c hostname run))))
-          val (cache/lookup cs hostname)]
+                      (if (cache/has? c host)
+                        (do
+                          (send pending-sync-agent aggregate-pending-sync-hostname host :pending)
+                          (cache/hit c host))
+                        (cache/miss c host run))))
+          val (cache/lookup cs host)]
       (if val @val @run))
     (catch Exception e
-      (log/error e "Failed to refresh mesos agent state" {:agent hostname}))))
-
-(defn sync-agent-sandboxes
-  "Asynchronously triggers state syncing from the mesos agent."
-  [publisher-state framework-id agent-hostname]
-  (when (and framework-id agent-hostname)
-    (future
-      (refresh-agent-cache-entry publisher-state framework-id agent-hostname))))
-
-(defn hostname->task-id->sandbox-directory
-  "Retrieves the sandbox directory of a task on a specific mesos agent."
-  [publisher-state framework-id hostname task-id]
-  (let [{:keys [data]} (refresh-agent-cache-entry publisher-state framework-id hostname)]
-    (get data task-id)))
+      (log/error e "Failed to refresh mesos agent state" {:host host}))))
 
 (defn update-sandbox
   "Sends a message to the agent to update the sandbox information."
   [{:keys [task-id->sandbox-agent]} {:strs [sandbox-directory task-id]}]
-  (send task-id->sandbox-agent aggregate-sandbox task-id sandbox-directory))
+  (when task-id->sandbox-agent
+    (send task-id->sandbox-agent aggregate-sandbox task-id sandbox-directory)))
+
+(defn sync-agent-sandboxes
+  "Asynchronously triggers state syncing from the mesos agent.
+   task-id may be nil, which means the sync was triggered for previously pending tasks on the host."
+  ([publisher-state framework-id agent-hostname]
+   (sync-agent-sandboxes publisher-state framework-id agent-hostname nil))
+  ([publisher-state framework-id agent-hostname task-id]
+   (when (and framework-id agent-hostname)
+     (future
+       (refresh-agent-cache-entry publisher-state framework-id agent-hostname task-id)))))
 
 (defn start-sandbox-publisher
   "Launches a timer task that triggers publishing of the task-id->sandbox state to datomic.
@@ -176,23 +271,66 @@
     {:error-handler (fn sandbox-publisher-error-handler [ex]
                       (log/error ex "Instance sandbox directory publish failed"))}))
 
+(defn start-host-sandbox-syncer
+  "Launches a timer task that triggers syncing of sandbox directories of any pending hosts."
+  [{:keys [mesos-agent-query-cache pending-sync-agent] :as publisher-state} sync-interval-ms max-consecutive-sync-failure]
+  (log/info "Starting sandbox syncer at intervals of" sync-interval-ms "ms")
+  (chime/chime-at
+    (periodic/periodic-seq (time/now) (time/millis sync-interval-ms))
+    (fn host-sandbox-syncer-task [_]
+      (let [{:keys [framework-id host->consecutive-failures pending-sync-hosts]} @pending-sync-agent
+            num-pending-sync-hosts (count pending-sync-hosts)]
+        (log/info num-pending-sync-hosts "hosts have pending syncs")
+        (loop [[hostname & remaining-hostnames] (seq pending-sync-hosts)
+               pending-sync-agent-send-performed false]
+          (let [consecutive-failures (get host->consecutive-failures hostname 0)]
+            (cond
+              (nil? hostname)
+              (when pending-sync-agent-send-performed
+                (log/debug "Awaiting to ensure agent sends in this chime iteration complete")
+                (await pending-sync-agent))
+
+              (>= consecutive-failures max-consecutive-sync-failure)
+              (do
+                (log/info "Removing entry for" hostname "with" consecutive-failures "consecutive failures")
+                (send pending-sync-agent clear-pending-sync-hostname hostname :threshold)
+                (recur remaining-hostnames true))
+
+              (not (cache/has? @mesos-agent-query-cache hostname))
+              (do
+                (log/info "Triggering pending sandbox sync of" hostname)
+                (send pending-sync-agent clear-pending-sync-hostname hostname :sync)
+                (sync-agent-sandboxes publisher-state framework-id hostname)
+                (recur remaining-hostnames true))
+
+              :else
+              (recur remaining-hostnames pending-sync-agent-send-performed))))))
+    {:error-handler (fn start-host-sandbox-syncer-error-handler [ex]
+                      (log/error ex "Sync of sandbox directories on pending hosts failed"))}))
+
 (defn prepare-sandbox-publisher
   "This function initializes the sandbox publisher as well as helper functions to send individual
    sandbox entries and trigger sandbox syncing of all tasks on a mesos agent.
    It returns a map with the following entries:
    :mesos-agent-query-cache - the cache that throttles the state sync calls to the mesos agents.
    :publisher-cancel-fn - fn that take no arguments and that terminates the publisher.
-   :retrieve-sandbox-directory-from-agent - fn that returns the sandbox directory given the hostname and task-id.
    :task-id->sandbox-agent - The agent that manages the task-id->sandbox aggregation and publishing."
-  [framework-id datomic-conn publish-batch-size publish-interval-ms mesos-agent-query-cache]
-  (let [task-id->sandbox-agent (agent {}) ;; stores all the pending task-id->sandbox state
-        publisher-state {:mesos-agent-query-cache mesos-agent-query-cache
-                         :task-id->sandbox-agent task-id->sandbox-agent}
+  [framework-id datomic-conn publish-batch-size publish-interval-ms sync-interval-ms max-consecutive-sync-failure
+   mesos-agent-query-cache]
+  (let [pending-sync-agent (agent {:framework-id framework-id
+                                   :host->consecutive-failures {}
+                                   :pending-sync-hosts #{}}) ;; stores the names of hosts pending sync
+        task-id->sandbox-agent (agent {}) ;; stores all the pending task-id->sandbox state
+        unprocessed-host->task-ids-atom (atom {}) ;; stores all pending task-id->sandbox entries that have not yet been filtered
+        publisher-state {:datomic-conn datomic-conn
+                         :mesos-agent-query-cache mesos-agent-query-cache
+                         :pending-sync-agent pending-sync-agent
+                         :task-id->sandbox-agent task-id->sandbox-agent
+                         :unprocessed-host->task-ids-atom unprocessed-host->task-ids-atom}
         publisher-cancel-fn (start-sandbox-publisher
                               task-id->sandbox-agent datomic-conn publish-batch-size publish-interval-ms)
-        retrieve-sandbox-directory-from-agent (fn retrieve-sandbox-directory-from-agent [agent-hostname task-id]
-                                                (hostname->task-id->sandbox-directory
-                                                  publisher-state framework-id agent-hostname task-id))]
+        syncer-cancel-fn (start-host-sandbox-syncer
+                           publisher-state sync-interval-ms max-consecutive-sync-failure)]
     (assoc publisher-state
       :publisher-cancel-fn publisher-cancel-fn
-      :retrieve-sandbox-directory-from-agent retrieve-sandbox-directory-from-agent)))
+      :syncer-cancel-fn syncer-cancel-fn)))

@@ -19,15 +19,18 @@
             [clj-time.core :as t]
             [clojure.core.async :as async]
             [clojure.core.cache :as cache]
+            [cook.config :as config]
             [cook.mesos.util :as util]
             [cook.test.testutil :as testutil
              :refer [create-dummy-group
                      create-dummy-instance
                      create-dummy-job
                      create-dummy-job-with-instances
+                     create-pool
                      restore-fresh-database!]]
             [datomic.api :as d :refer (q db)])
-  (:import [java.util Date]))
+  (:import [java.util Date]
+           [java.util.concurrent ExecutionException]))
 
 (deftest test-total-resources-of-jobs
   (let [uri "datomic:mem://test-total-resources-of-jobs"
@@ -49,19 +52,93 @@
 (deftest test-get-running-job-ents
   (let [uri "datomic:mem://test-get-running-task-ents"
         conn (restore-fresh-database! uri)]
-    (create-dummy-job conn :user "u1" :job-state :job.state/completed)
-    (create-dummy-job conn :user "u1" :job-state :job.state/running)
-    (create-dummy-job conn :user "u1" :job-state :job.state/running)
-    (create-dummy-job conn :user "u2" :job-state :job.state/waiting)
-    (create-dummy-job conn :user "u2" :job-state :job.state/running)
-    (create-dummy-job conn :user "u1" :job-state :job.state/waiting)
-    (create-dummy-job conn :user "u1" :job-state :job.state/waiting)
+    (create-pool conn "pool-a")
+    (create-pool conn "pool-b")
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/completed)
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/running
+                      :pool "pool-a")
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/running
+                      :pool "pool-a")
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/running
+                      :pool "pool-b")
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/running)
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/running)
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/waiting)
+    (create-dummy-job conn
+                      :user "u1"
+                      :job-state :job.state/waiting)
+    (create-dummy-job conn
+                      :user "u2"
+                      :job-state :job.state/running
+                      :pool "pool-a")
+    (create-dummy-job conn
+                      :user "u2"
+                      :job-state :job.state/running
+                      :pool "pool-b")
+    (create-dummy-job conn
+                      :user "u2"
+                      :job-state :job.state/running)
+    (create-dummy-job conn
+                      :user "u2"
+                      :job-state :job.state/waiting)
+    (create-dummy-job conn
+                      :user "u3"
+                      :job-state :job.state/running
+                      :pool "pool-a")
+
+    ; No default pool, specifying a specific pool
+    (is (= 2 (count (util/get-user-running-job-ents-in-pool (db conn) "u1" "pool-a"))))
+    (is (= 1 (count (util/get-user-running-job-ents-in-pool (db conn) "u2" "pool-b"))))
+    (is (= 0 (count (util/get-user-running-job-ents-in-pool (db conn) "u3" "pool-c"))))
+
+    ; No default pool, not specifying a pool
+    (is (= 2 (count (util/get-user-running-job-ents-in-pool (db conn) "u1" nil))))
+    (is (= 1 (count (util/get-user-running-job-ents-in-pool (db conn) "u2" nil))))
+    (is (= 0 (count (util/get-user-running-job-ents-in-pool (db conn) "u3" nil))))
+
+    ; Default pool defined, specifying a specific pool
+    (with-redefs [config/default-pool (constantly "pool-a")]
+      (is (= 4 (count (util/get-user-running-job-ents-in-pool (db conn) "u1" "pool-a"))))
+      (is (= 1 (count (util/get-user-running-job-ents-in-pool (db conn) "u2" "pool-b"))))
+      (is (= 0 (count (util/get-user-running-job-ents-in-pool (db conn) "u3" "pool-c")))))
+
+    ; Default pool defined, not specifying a pool
+    (with-redefs [config/default-pool (constantly "pool-b")]
+      (is (= 3 (count (util/get-user-running-job-ents-in-pool (db conn) "u1" nil))))
+      (is (= 2 (count (util/get-user-running-job-ents-in-pool (db conn) "u2" nil))))
+      (is (= 0 (count (util/get-user-running-job-ents-in-pool (db conn) "u3" nil)))))))
+
+(deftest test-cache
+  (let [cache (util/new-cache)
+        extract-fn #(if (odd? %) nil %)
+        miss-fn #(if (> % 100) nil %)]
     ;; u1 has 2 jobs running
-    (is (= 2 (count (util/get-user-running-job-ents (db conn) "u1"))))
-    ;; u2 has 1 jobs running
-    (is (= 1 (count (util/get-user-running-job-ents (db conn) "u2"))))
-    ;; u3 has no jobs (running or otherwise)
-    (is (= 0 (count (util/get-user-running-job-ents (db conn) "u3"))))))
+    (is (= 1 (util/lookup-cache! cache extract-fn miss-fn 1))) ; Should not be cached. Nil from extractor.
+    (is (= 2 (util/lookup-cache! cache extract-fn miss-fn 2))) ; Should be cached.
+    (is (= nil (.getIfPresent cache 1)))
+    (is (= 2 (.getIfPresent cache 2)))
+    (is (= nil (util/lookup-cache! cache extract-fn miss-fn 101))) ; Should not be cached. Nil from miss function
+    (is (= nil (util/lookup-cache! cache extract-fn miss-fn 102))) ; Should not be cached. Nil from miss function
+    (is (= nil (.getIfPresent cache 101)))
+    (is (= nil (.getIfPresent cache 102)))
+    (is (= 4 (util/lookup-cache! cache extract-fn miss-fn 4))) ; Should be cached.
+    (is (= 2 (.getIfPresent cache 2)))
+    (is (= 4 (.getIfPresent cache 4)))))
+
 
 (deftest test-get-pending-job-ents
   (let [uri "datomic:mem://test-get-pending-job-ents"
@@ -343,18 +420,21 @@
       ;; test less flaky 
       (let [start-time (Date.)
             job1 (create-dummy-job conn
+                                   :name "job1"
                                    :user "u1"
                                    :job-state state
                                    :submit-time (Date.)
                                    :custom-executor? false)
             ; this job should never be returned.
             _ (create-dummy-job conn
+                                :name "job1.5"
                                 :user "u1"
                                 :job-state state
                                 :submit-time (Date.)
                                 :custom-executor? true)
             _ (Thread/sleep 5)
             job2 (create-dummy-job conn
+                                   :name "job2"
                                    :user "u1"
                                    :job-state state
                                    :submit-time (Date.)
@@ -362,12 +442,14 @@
             _ (Thread/sleep 5)
             half-way-time (Date.)
             job3 (create-dummy-job conn
+                                   :name "job3"
                                    :user "u2"
                                    :job-state state
                                    :submit-time (Date.)
                                    :custom-executor? false)
             _ (Thread/sleep 5)
             job4 (create-dummy-job conn
+                                   :name "job4"
                                    :user "u1"
                                    :job-state state
                                    :submit-time (Date.)
@@ -375,21 +457,49 @@
             _ (Thread/sleep 5)
             end-time (Date.)
             states [(name state)]
-            name (constantly true)]
+            match-any-name-fn (constantly true)
+            match-no-name-fn (constantly false)]
         (testing (str "get " state " jobs")
-          (is (= 2 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 10 name))))
-          (is (= 1 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 name))))
-          (is (= (map :db/id (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 name))
+          (is (= 2 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 10 match-any-name-fn false))))
+          (is (= 1 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 match-any-name-fn false))))
+          (is (= (map :db/id (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 match-any-name-fn false))
                  [job1]))
-          (is (= 3 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 10 name))))
-          (is (= 2 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 name))))
-          (is (= (map :db/id (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 name))
+          (is (= 3 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 10 match-any-name-fn false))))
+          (is (= 2 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 match-any-name-fn false))))
+          (is (= (map :db/id (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 match-any-name-fn false))
                  [job1 job2]))
 
-          (is (= 1 (count (util/get-jobs-by-user-and-states (d/db conn) "u2" states start-time end-time 10 name))))
-          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u3" states start-time end-time 10 name))))
+          (is (= 1 (count (util/get-jobs-by-user-and-states (d/db conn) "u2" states start-time end-time 10 match-any-name-fn false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u3" states start-time end-time 10 match-any-name-fn false))))
           (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states
-                                                            #inst "2017-06-01" #inst "2017-06-02" 10 name)))))))))
+                                                            #inst "2017-06-01" #inst "2017-06-02" 10 match-any-name-fn false)))))
+        ; Nil means the same as always true.
+        (testing (str "get " state " jobs ; name = nil")
+          (is (= 2 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 10 nil false))))
+          (is (= 1 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 nil false))))
+          (is (= (map :db/id (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 nil false))
+                 [job1]))
+          (is (= 3 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 10 nil false))))
+          (is (= 2 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 nil false))))
+          (is (= (map :db/id (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 nil false))
+                 [job1 job2]))
+
+          (is (= 1 (count (util/get-jobs-by-user-and-states (d/db conn) "u2" states start-time end-time 10 nil false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u3" states start-time end-time 10 nil false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states
+                                                            #inst "2017-06-01" #inst "2017-06-02" 10 nil false)))))
+        ; Never true, so should match nothing.
+        (testing (str "get " state " jobs ; name = false")
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 10 match-no-name-fn false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time half-way-time 1 match-no-name-fn false))))
+
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 10 match-no-name-fn false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states start-time end-time 2 match-no-name-fn false))))
+
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u2" states start-time end-time 10 match-no-name-fn false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u3" states start-time end-time 10 match-no-name-fn false))))
+          (is (= 0 (count (util/get-jobs-by-user-and-states (d/db conn) "u1" states
+                                                            #inst "2017-06-01" #inst "2017-06-02" 10 match-no-name-fn false)))))))))
 
 (deftest test-reducing-pipe
   (testing "basic piping"
@@ -452,5 +562,87 @@
 
     (is (= 12 (util/cache-lookup! cache-store "A" 12)))
     (is (= {"A" 12, "C" 31} (.cache @cache-store)))))
+
+
+(deftest test-retry-job
+  (let [uri "datomic:mem://test-retry-job"
+        conn (restore-fresh-database! uri)]
+    (testing "increment retries on running job"
+      (let [[job _] (create-dummy-job-with-instances conn
+                                                     :job-state :job.state/running
+                                                     :retry-count 5
+                                                     :instances [{:instance-status :instance.status/running}])
+            uuid (:job/uuid (d/entity (d/db conn) job))]
+        (util/retry-job! conn uuid 10)
+        (let [job-ent (d/entity (d/db conn) job)]
+          (is (= 10 (:job/max-retries job-ent)))
+          (is (= :job.state/running (:job/state job-ent))))))
+
+    (testing "same retries on completed jobs with attempts remaining"
+      (let [[job _] (create-dummy-job-with-instances conn
+                                                     :job-state :job.state/completed
+                                                     :retry-count 2
+                                                     :instances [{:instance-status :instance.status/failed}])
+            job-uuid (:job/uuid (d/entity (d/db conn) job))]
+        (util/retry-job! conn job-uuid 2)
+        (let [job-ent (d/entity (d/db conn) job)]
+          (is (= 2 (:job/max-retries job-ent)))
+          (is (= :job.state/waiting (:job/state job-ent))))))
+
+    (testing "same retries on completed jobs with mea-culpa attempts remaining"
+      (let [[job _] (create-dummy-job-with-instances conn
+                                                    :job-state :job.state/completed
+                                                    :retry-count 1
+                                                    :instances [{:instance-status :instance.status/failed
+                                                                 :reason :preempted-by-rebalancer}])
+            job-uuid (:job/uuid (d/entity (d/db conn) job))]
+        (util/retry-job! conn job-uuid 1)
+        (let [job-ent (d/entity (d/db conn) job)]
+          (is (= 1 (:job/max-retries job-ent)))
+          (is (= :job.state/waiting (:job/state job-ent))))))
+
+    (testing "same retries on job with no attempts remaining"
+      (let [[job _] (create-dummy-job-with-instances conn
+                                                     :job-state :job.state/completed
+                                                     :retry-count 1
+                                                     :instances [{:instance-status :instance.status/failed}])
+            job-uuid (:job/uuid (d/entity (d/db conn) job))]
+        (util/retry-job! conn job-uuid 1)
+        (let [job-ent (d/entity (d/db conn) job)]
+          (is (= 1 (:job/max-retries job-ent)))
+          (is (= :job.state/completed (:job/state job-ent))))))
+
+    (testing "increment retries on waiting job"
+      (let [job (create-dummy-job conn
+                                  :job-state :job.state/waiting
+                                  :retry-count 5)
+            job-uuid (:job/uuid (d/entity (d/db conn) job))]
+        (util/retry-job! conn job-uuid 20)
+        (let [job-ent (d/entity (d/db conn) job)]
+          (is (= 20 (:job/max-retries job-ent)))
+          (is (= :job.state/waiting (:job/state job-ent))))))
+
+    (testing "decrease retries to less than attempts consumed"
+      (let [[job _] (create-dummy-job-with-instances conn
+                                                     :retry-count 5
+                                                     :job-state :job.state/completed
+                                                     :instances [{:instance-status :instance.status/failed}
+                                                                 {:instance-status :instance.status/failed}
+                                                                 {:instance-status :instance.status/failed}])
+            job-uuid (:job/uuid (d/entity (d/db conn) job))]
+        (is (thrown-with-msg? ExecutionException #"Attempted to change retries from 5 to 2"
+                              (util/retry-job! conn job-uuid 2)))))
+
+    (testing "decrease retries with attempts remaining"
+      (let [[job _] (create-dummy-job-with-instances conn
+                                                     :job-state :job.state/completed
+                                                     :retry-count 5
+                                                     :instances [{:instance-status :instance.status/failed
+                                                                  :reason :preempted-by-rebalancer}])
+            job-uuid (:job/uuid (d/entity (d/db conn) job))]
+        (util/retry-job! conn job-uuid 1)
+        (let [job-ent (d/entity (d/db conn) job)]
+          (is (= 1 (:job/max-retries job-ent)))
+          (is (= :job.state/waiting (:job/state job-ent))))))))
 
 (comment (run-tests))

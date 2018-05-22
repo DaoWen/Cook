@@ -5,10 +5,12 @@ import logging
 import subprocess
 import time
 import unittest
+from unittest.mock import patch
 from threading import Event, Timer
 
 import os
 import pymesos as pm
+import pytest
 
 import cook
 import cook.config as cc
@@ -519,6 +521,10 @@ class ExecutorTest(unittest.TestCase):
         command = 'echo "Hello World"; exit 1'
         self.manage_task_runner(command, assertions)
 
+    # FIXME - remove the xfail mark once the issue with this test crashing is resolved:
+    # https://github.com/twosigma/Cook/issues/678
+    @pytest.mark.xfail
+    @unittest.skip('This test crashes occasionally')
     def test_manage_task_terminated(self):
         def assertions(driver, task_id, sandbox_directory):
             expected_statuses = [{'task_id': {'value': task_id}, 'state': cook.TASK_STARTING},
@@ -837,3 +843,19 @@ class ExecutorTest(unittest.TestCase):
         finally:
             tu.cleanup_output(stdout_name, stderr_name)
             tu.cleanup_file(output_name)
+
+    @patch('os._exit')
+    def test_executor_exit_env_variable(self, mock_exit):
+        os.environ['EXECUTOR_TEST_EXIT'] = '5'
+        try:
+            config = cc.ExecutorConfig()
+            stop_signal = Event()
+            executor = ce.CookExecutor(stop_signal, config)
+            driver = tu.FakeMesosExecutorDriver()
+            executor_info = {'executor_id': {'value': 'test'}}
+            framework_info = {'id': 'framework'}
+            agent_info = {'id': {'value': 'agent'}}
+            executor.registered(driver, executor_info, framework_info, agent_info)
+            mock_exit.assert_called_with(5)
+        finally:
+            del os.environ['EXECUTOR_TEST_EXIT']

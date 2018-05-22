@@ -16,9 +16,35 @@
 (ns cook.datomic
   (:require [clojure.core.async :as async]
             [clojure.pprint :refer (pprint)]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
-            [cook.util :refer (deftraced)]
-            [datomic.api :as d :refer (q)]))
+            [cook.config :refer (config)]
+            [cook.util :as util]
+            [datomic.api :as d :refer (q)]
+            [mount.core :as mount])
+  (:import (clojure.lang Agent)
+           (datomic Connection)
+           (java.util.concurrent BlockingQueue TimeUnit)))
+
+(defn create-connection
+  "Creates and returns a connection to the given Datomic URI"
+  [{{:keys [mesos-datomic-uri]} :settings}]
+  ((util/lazy-load-var 'datomic.api/create-database) mesos-datomic-uri)
+  (let [conn ((util/lazy-load-var 'datomic.api/connect) mesos-datomic-uri)]
+    (doseq [txn (deref (util/lazy-load-var 'cook.mesos.schema/work-item-schema))]
+      (deref ((util/lazy-load-var 'datomic.api/transact) conn txn))
+      ((util/lazy-load-var 'metatransaction.core/install-metatransaction-support) conn)
+      ((util/lazy-load-var 'metatransaction.utils/install-utils-support) conn))
+    conn))
+
+(defn disconnect
+  "Releases the given Datomic connection"
+  [^Connection conn]
+  (.release conn))
+
+(mount/defstate conn
+                :start (create-connection config)
+                :stop (disconnect conn))
 
 (defn create-tx-report-mult
   "Takes a datomic connection, and returns a core.async mult that can
@@ -33,8 +59,8 @@
                (try
                  (while @running
                    (try
-                     (when-let [e (.poll ^java.util.concurrent.BlockingQueue report-q
-                                         1 java.util.concurrent.TimeUnit/SECONDS)]
+                     (when-let [e (.poll ^BlockingQueue report-q
+                                         1 TimeUnit/SECONDS)]
                        (case (async/alt!!
                                [[inner-chan e]] :wrote
                                ;; The value for :default is eagerly evaluated, unlike for other clauses
@@ -42,7 +68,7 @@
                                :priority true)
                          :dropped (log/error "dropped item from tx-report-mult--maybe there's a slow consumer?")
                          nil))
-                     (catch InterruptedException e nil)))
+                     (catch InterruptedException _ nil)))
                  (catch Exception e
                    (log/error e "tx report queue tap got borked. That's bad."))))]
     [mult
@@ -67,7 +93,7 @@
                         (try
                           (let [fut (d/transact-async conn txn)
                                 c (async/chan)]
-                            (d/add-listener fut #(async/close! c) clojure.lang.Agent/pooledExecutor)
+                            (d/add-listener fut #(async/close! c) Agent/pooledExecutor)
                             (async/<! c)
                             @fut
                             :success)
@@ -80,15 +106,22 @@
          (async/<! (async/timeout sleep))
          (recur sched))))))
 
-(deftraced pq
-  "Executes a datomic query under miniprofiler"
-  {:custom-timing ["datomic" "query"
-                   (fn [query & _] (with-out-str (pprint query)))]}
-  ([query] (q query))
-  ([query a] (q query a))
-  ([query a b] (q query a b))
-  ([query a b c] (q query a b c))
-  ([query a b c d] (q query a b c d))
-  ([query a b c d e] (q query a b c d e))
-  ([query a b c d e f] (q query a b c d e f))
-  ([query a b c d e f & rest] (apply q query a b c d e f rest)))
+(defn transaction-timeout?
+  "Returns true if the given exception is due to a transaction timeout"
+  [exception]
+  (str/includes? (str (.getMessage exception)) "Transaction timed out."))
+
+(defn transact
+  "Like datomic.api/transact, except the caller provides
+  a handler function for transaction timeout exceptions"
+  [conn tx-data handle-timeout-fn]
+  (try
+    @(d/transact conn tx-data)
+    (catch Exception e
+      (if (transaction-timeout? e)
+        (do
+          (log/warn e "Datomic transaction timed out")
+          (handle-timeout-fn e))
+        (do
+          (log/error e "Datomic transaction caused exception")
+          (throw e))))))

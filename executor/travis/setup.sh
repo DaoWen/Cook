@@ -6,4 +6,4 @@ export PROJECT_DIR=`pwd`
 cd ${PROJECT_DIR}
 
 python --version
-python setup.py install
+pip install --user -e '.[test]'

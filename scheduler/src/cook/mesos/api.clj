@@ -16,6 +16,7 @@
 (ns cook.mesos.api
   (:require [camel-snake-kebab.core :refer [->snake_case ->kebab-case]]
             [cheshire.core :as cheshire]
+            [clj-time.coerce :as tc]
             [clj-time.core :as t]
             [clj-time.format :as tf]
             [clojure.set :as set]
@@ -25,14 +26,19 @@
             [compojure.api.middleware :as c-mw]
             [compojure.api.sweet :as c-api]
             [compojure.core :refer [ANY GET POST routes]]
+            [cook.config :as config]
+            [cook.cors :as cors]
+            [cook.datomic :as datomic]
+            [cook.mesos.pool :as pool]
             [cook.mesos.quota :as quota]
             [cook.mesos.reason :as reason]
             [cook.mesos.schema :refer [constraint-operators host-placement-types straggler-handling-types]]
             [cook.mesos.share :as share]
+            [cook.mesos.task-stats :as task-stats]
             [cook.mesos.unscheduled :as unscheduled]
             [cook.mesos.util :as util]
             [cook.mesos]
-            [cook.util]
+            [cook.util :refer [ZeroInt PosNum NonNegNum PosInt NonNegInt PosDouble UserName NonEmptyString]]
             [datomic.api :as d :refer [q]]
             [liberator.core :as liberator]
             [liberator.util :refer [combine]]
@@ -40,6 +46,7 @@
             [mesomatic.scheduler]
             [metatransaction.core :refer [db]]
             [metrics.histograms :as histograms]
+            [metrics.meters :as meters]
             [metrics.timers :as timers]
             [plumbing.core :refer [map-from-vals map-keys map-vals mapply]]
             [ring.middleware.format-params :as format-params]
@@ -47,13 +54,13 @@
             [schema.core :as s]
             [swiss.arrows :refer :all])
   (:import (clojure.lang Atom Var)
-           com.codahale.metrics.riemann.RiemannReporter
+           com.codahale.metrics.ScheduledReporter
            (java.io OutputStreamWriter)
            (java.net ServerSocket URLEncoder)
            (java.util Date UUID)
            javax.servlet.ServletResponse
            org.apache.curator.test.TestingServer
-           org.joda.time.Minutes
+           (org.joda.time DateTime Minutes)
            schema.core.OptionalKey))
 
 
@@ -83,6 +90,7 @@
    :handle-forbidden render-error
    :handle-malformed render-error
    :handle-not-found render-error
+   :handle-conflict render-error
    :handle-unprocessable-entity render-error})
 
 (defn base-cook-handler
@@ -104,27 +112,6 @@
                 (update k :k ->snake_case)
                 (->snake_case k)))
             schema))
-
-(def ZeroInt
-  (s/both s/Int (s/pred zero? 'zero?)))
-
-(def PosNum
-  (s/both s/Num (s/pred pos? 'pos?)))
-
-(def PosInt
-  (s/both s/Int (s/pred pos? 'pos?)))
-
-(def NonNegInt
-  (s/both s/Int (s/pred (comp not neg?) 'non-negative?)))
-
-(def PosDouble
-  (s/both double (s/pred pos? 'pos?)))
-
-(def UserName
-  (s/both s/Str (s/pred #(re-matches #"\A[a-z][a-z0-9_-]{0,62}[a-z0-9]\z" %) 'lowercase-alphanum?)))
-
-(def NonEmptyString
-  (s/both s/Str (s/pred #(not (zero? (count %))) 'not-empty-string)))
 
 (def iso-8601-format (:date-time tf/formatters))
 
@@ -312,7 +299,8 @@
               :user UserName
               (s/optional-key :gpus) s/Int
               (s/optional-key :groups) [s/Uuid]
-              (s/optional-key :instances) [Instance]})
+              (s/optional-key :instances) [Instance]
+              (s/optional-key :pool) s/Str})
       prepare-schema-response))
 
 (def JobResponseDeprecated
@@ -346,11 +334,19 @@
   (-> JobOrInstanceIds
       (assoc (s/optional-key :partial) s/Bool)))
 
+(def allowed-list-states (set/union util/job-states util/instance-states))
+
 (def QueryJobsParams
   "Schema for querying for jobs by job uuid, allowing optionally for
   'partial' results, meaning that some uuids can be valid and others not"
-  {:uuid [s/Uuid]
-   (s/optional-key :partial) s/Bool})
+  {(s/optional-key :uuid) [s/Uuid]
+   (s/optional-key :partial) s/Bool
+   (s/optional-key :user) UserName
+   (s/optional-key :state) [(apply s/enum allowed-list-states)]
+   (s/optional-key :start) s/Str
+   (s/optional-key :end) s/Str
+   (s/optional-key :limit) NonNegInt
+   (s/optional-key :name) JobNameListFilter})
 
 (def QueryInstancesParams
   "Schema for querying for instances by instance uuid, allowing optionally for
@@ -424,11 +420,20 @@
          (s/optional-key :completed) s/Int})
       prepare-schema-response))
 
-(def RawSchedulerRequest
-  "Schema for a request to the raw scheduler endpoint."
+(def JobSubmission
+  "Schema for a request to submit one or more jobs."
   {:jobs [JobRequest]
    (s/optional-key :override-group-immutability) s/Bool
    (s/optional-key :groups) [Group]})
+
+(def RawSchedulerRequestDeprecated
+  "Schema for a request to the raw scheduler endpoint."
+  JobSubmission)
+
+(def JobSubmissionRequest
+  "Schema for a POST request to the /jobs endpoint."
+  (assoc JobSubmission
+    (s/optional-key :pool) s/Str))
 
 (defn- mk-container-params
   "Helper for build-container.  Transforms parameters into the datomic schema."
@@ -509,7 +514,7 @@
 
 (s/defn make-job-txn
   "Creates the necessary txn data to insert a job into the database"
-  [job :- Job]
+  [pool job :- Job]
   (let [{:keys [uuid command max-retries max-runtime expected-runtime priority cpus mem gpus
                 user name ports uris env labels container group application disable-mea-culpa-retries
                 constraints executor progress-output-file progress-regex-string]
@@ -598,7 +603,8 @@
                     expected-runtime (assoc :job/expected-runtime expected-runtime)
                     executor (assoc :job/executor executor)
                     progress-output-file (assoc :job/progress-output-file progress-output-file)
-                    progress-regex-string (assoc :job/progress-regex-string progress-regex-string))]
+                    progress-regex-string (assoc :job/progress-regex-string progress-regex-string)
+                    pool (assoc :job/pool (:db/id pool)))]
 
     ;; TODO batch these transactions to improve performance
     (-> ports
@@ -795,12 +801,11 @@
 
 (defn fetch-instance-map
   "Converts the instance entity to a map representing the instance fields."
-  [db instance retrieve-sandbox-directory-from-agent]
+  [db instance]
   (let [hostname (:instance/hostname instance)
         task-id (:instance/task-id instance)
         executor (:instance/executor instance)
-        sandbox-directory (or (:instance/sandbox-directory instance)
-                              (retrieve-sandbox-directory-from-agent hostname task-id))
+        sandbox-directory (:instance/sandbox-directory instance)
         url-path (retrieve-url-path hostname task-id sandbox-directory)
         start (:instance/start-time instance)
         mesos-start (:instance/mesos-start-time instance)
@@ -832,54 +837,58 @@
             sandbox-directory (assoc :sandbox_directory sandbox-directory))))
 
 (defn fetch-job-map
-  [db framework-id retrieve-sandbox-directory-from-agent job-uuid]
-  (let [job (d/entity db [:job/uuid job-uuid])
-        resources (util/job-ent->resources job)
-        groups (:group/_job job)
-        application (:job/application job)
-        expected-runtime (:job/expected-runtime job)
-        executor (:job/executor job)
-        progress-output-file (:job/progress-output-file job)
-        progress-regex-string (:job/progress-regex-string job)
-        state (util/job-ent->state job)
-        constraints (->> job
-                         :job/constraint
-                         (map util/remove-datomic-namespacing)
-                         (map (fn [{:keys [attribute operator pattern]}]
-                                (->> [attribute (str/upper-case (name operator)) pattern]
-                                     (map str)))))
-        instances (map #(fetch-instance-map db %1 retrieve-sandbox-directory-from-agent) (:job/instance job))
-        submit-time (when (:job/submit-time job) ; due to a bug, submit time may not exist for some jobs
-                     (.getTime (:job/submit-time job)))
-        job-map {:command (:job/command job)
-                 :constraints constraints
-                 :cpus (:cpus resources)
-                 :disable_mea_culpa_retries (:job/disable-mea-culpa-retries job false)
-                 :env (util/job-ent->env job)
-                 :framework_id framework-id
-                 :gpus (int (:gpus resources 0))
-                 :instances instances
-                 :labels (util/job-ent->label job)
-                 :max_retries (:job/max-retries job) ; consistent with input
-                 :max_runtime (:job/max-runtime job Long/MAX_VALUE) ; consistent with input
-                 :mem (:mem resources)
-                 :name (:job/name job "cookjob")
-                 :ports (:job/ports job 0)
-                 :priority (:job/priority job util/default-job-priority)
-                 :retries_remaining (- (:job/max-retries job) (util/job-ent->attempts-consumed db job))
-                 :state state
-                 :status (name (:job/state job))
-                 :submit_time submit-time
-                 :uris (:uris resources)
-                 :user (:job/user job)
-                 :uuid (:job/uuid job)}]
-    (cond-> job-map
-            groups (assoc :groups (map #(str (:group/uuid %)) groups))
-            application (assoc :application (util/remove-datomic-namespacing application))
-            expected-runtime (assoc :expected-runtime expected-runtime)
-            executor (assoc :executor (name executor))
-            progress-output-file (assoc :progress-output-file progress-output-file)
-            progress-regex-string (assoc :progress-regex-string progress-regex-string))))
+  [db framework-id job-uuid]
+  (timers/time!
+    (timers/timer ["cook-mesos" "internal" "fetch-job-map"])
+    (let [job (d/entity db [:job/uuid job-uuid])
+          resources (util/job-ent->resources job)
+          groups (:group/_job job)
+          application (:job/application job)
+          expected-runtime (:job/expected-runtime job)
+          executor (:job/executor job)
+          progress-output-file (:job/progress-output-file job)
+          progress-regex-string (:job/progress-regex-string job)
+          pool (:job/pool job)
+          state (util/job-ent->state job)
+          constraints (->> job
+                           :job/constraint
+                           (map util/remove-datomic-namespacing)
+                           (map (fn [{:keys [attribute operator pattern]}]
+                                  (->> [attribute (str/upper-case (name operator)) pattern]
+                                       (map str)))))
+          instances (map #(fetch-instance-map db %1) (:job/instance job))
+          submit-time (when (:job/submit-time job) ; due to a bug, submit time may not exist for some jobs
+                        (.getTime (:job/submit-time job)))
+          job-map {:command (:job/command job)
+                   :constraints constraints
+                   :cpus (:cpus resources)
+                   :disable_mea_culpa_retries (:job/disable-mea-culpa-retries job false)
+                   :env (util/job-ent->env job)
+                   :framework_id framework-id
+                   :gpus (int (:gpus resources 0))
+                   :instances instances
+                   :labels (util/job-ent->label job)
+                   :max_retries (:job/max-retries job) ; consistent with input
+                   :max_runtime (:job/max-runtime job Long/MAX_VALUE) ; consistent with input
+                   :mem (:mem resources)
+                   :name (:job/name job "cookjob")
+                   :ports (:job/ports job 0)
+                   :priority (:job/priority job util/default-job-priority)
+                   :retries_remaining (- (:job/max-retries job) (util/job-ent->attempts-consumed db job))
+                   :state state
+                   :status (name (:job/state job))
+                   :submit_time submit-time
+                   :uris (:uris resources)
+                   :user (:job/user job)
+                   :uuid (:job/uuid job)}]
+      (cond-> job-map
+              groups (assoc :groups (map #(str (:group/uuid %)) groups))
+              application (assoc :application (util/remove-datomic-namespacing application))
+              expected-runtime (assoc :expected-runtime expected-runtime)
+              executor (assoc :executor (name executor))
+              progress-output-file (assoc :progress-output-file progress-output-file)
+              progress-regex-string (assoc :progress-regex-string progress-regex-string)
+              pool (assoc :pool (:pool/name pool))))))
 
 (defn fetch-group-live-jobs
   "Get all jobs from a group that are currently running or waiting (not complete)"
@@ -1102,11 +1111,11 @@
       [true exist-data])))
 
 (defn render-jobs-for-response-deprecated
-  [conn framework-id retrieve-sandbox-directory-from-agent ctx]
-  (mapv (partial fetch-job-map (db conn) framework-id retrieve-sandbox-directory-from-agent) (::jobs ctx)))
+  [conn framework-id ctx]
+  (mapv (partial fetch-job-map (db conn) framework-id) (::jobs ctx)))
 
 (defn render-jobs-for-response
-  [conn framework-id retrieve-sandbox-directory-from-agent ctx]
+  [conn framework-id ctx]
   (let [db (db conn)
 
         fetch-group
@@ -1117,16 +1126,16 @@
 
         fetch-job
         (fn fetch-job [job-uuid]
-          (let [job (fetch-job-map db framework-id retrieve-sandbox-directory-from-agent job-uuid)
+          (let [job (fetch-job-map db framework-id job-uuid)
                 groups (mapv fetch-group (:groups job))]
             (assoc job :groups groups)))]
 
     (mapv fetch-job (::jobs ctx))))
 
 (defn render-instances-for-response
-  [conn framework-id retrieve-sandbox-directory-from-agent ctx]
+  [conn framework-id ctx]
   (let [db (db conn)
-        fetch-job (partial fetch-job-map db framework-id retrieve-sandbox-directory-from-agent)
+        fetch-job (partial fetch-job-map db framework-id)
         job-uuids (::jobs ctx)
         jobs (mapv fetch-job job-uuids)
         instance-uuids (set (::instances ctx))]
@@ -1137,13 +1146,14 @@
       (-> instance
           (assoc :job (select-keys job [:uuid :name :status :state :user]))))))
 
+;; We store the start-up time (ISO-8601) for reporting on the /info endpoint
+(def start-up-time (tf/unparse iso-8601-format (t/now)))
+
 (defn cook-info-handler
   "Handler for the /info endpoint"
   [settings]
   (let [auth-middleware (:authorization-middleware settings)
-        auth-scheme (str (or (-> auth-middleware meta :json-value) auth-middleware))
-        ;; We store the start-up time (ISO-8601) for reporting on the /info endpoint
-        start-up-time (tf/unparse iso-8601-format (t/now))]
+        auth-scheme (str (or (-> auth-middleware meta :json-value) auth-middleware))]
     (base-cook-handler
       {:allowed-methods [:get]
        :handle-ok (fn get-info-handler [_]
@@ -1154,34 +1164,160 @@
 
 ;;; On GET; use repeated job argument
 (defn read-jobs-handler-deprecated
-  [conn framework-id is-authorized-fn retrieve-sandbox-directory-from-agent]
+  [conn framework-id is-authorized-fn]
   (base-cook-handler
     {:allowed-methods [:get]
      :malformed? check-job-params-present
      :allowed? (partial job-request-allowed? conn is-authorized-fn)
      :exists? (partial retrieve-jobs conn)
-     :handle-ok (fn [ctx] (render-jobs-for-response-deprecated conn framework-id retrieve-sandbox-directory-from-agent ctx))}))
+     :handle-ok (fn [ctx] (render-jobs-for-response-deprecated conn framework-id ctx))}))
+
+(defn valid-name-filter?
+  "Returns true if the provided name filter is either nil or satisfies the JobNameListFilter schema"
+  [name]
+  (or (nil? name)
+      (nil? (s/check JobNameListFilter name))))
+
+(defn normalize-list-states
+  "Given a set, states, returns a new set that only contains one of the
+  'terminal' states of completed, success, and failed. We take completed
+  to mean both success and failed."
+  [states]
+  (if (contains? states "completed")
+    (set/difference states util/instance-states)
+    (if (set/superset? states util/instance-states)
+      (-> states (set/difference util/instance-states) (conj "completed"))
+      states)))
+
+(defn name-filter-str->name-filter-pattern
+  "Generates a regex pattern corresponding to a user-provided name filter string"
+  [name]
+  (re-pattern (-> name
+                  (str/replace #"\." "\\\\.")
+                  (str/replace #"\*+" ".*"))))
+
+(defn name-filter-str->name-filter-fn
+  "Returns a name-filtering function (or nil) given a user-provided name filter string"
+  [name]
+  (when name
+    (let [pattern (name-filter-str->name-filter-pattern name)]
+      #(re-matches pattern %))))
+
+(defn job-list-request-malformed?
+  "Returns a [true {::error ...}] pair if the request is malformed, and
+  otherwise [false m], where m represents data that gets merged into the ctx"
+  [ctx]
+  (let [{:strs [state user start end limit name]} (get-in ctx [:request :query-params])
+        states (wrap-seq state)]
+    (cond
+      (not (and states user start end))
+      [true {::error "must supply the state, user name, start time, and end time"}]
+
+      (not (set/superset? allowed-list-states states))
+      [true {::error (str "unsupported state in " states ", must be one of: " allowed-list-states)}]
+
+      (not (valid-name-filter? name))
+      [true {::error
+             (str "unsupported name filter " name
+                  ", can only contain alphanumeric characters, '.', '-', '_', and '*' as a wildcard")}]
+
+      :else
+      (try
+        [false {::states (normalize-list-states states)
+                ::user user
+                ::start-ms (-> start ^DateTime util/parse-time .getMillis)
+                ::end-ms (-> end ^DateTime util/parse-time .getMillis)
+                ::limit (util/parse-int-default limit 150)
+                ::name-filter-fn (name-filter-str->name-filter-fn name)}]
+        (catch NumberFormatException e
+          [true {::error (.toString e)}])))))
+
+(defn job-list-request-allowed?
+  [is-authorized-fn ctx]
+  (let [{limit ::limit, user ::user, start-ms ::start-ms, end-ms ::end-ms} ctx
+        request-user (get-in ctx [:request :authorization/user])
+        impersonator (get-in ctx [:request :authorization/impersonator])]
+    (cond
+      (not (is-authorized-fn request-user :get impersonator {:owner user :item :job}))
+      [false {::error (str "You are not authorized to list jobs for " user)}]
+
+      (not (pos? limit))
+      [false {::error (str "limit must be positive")}]
+
+      (and start-ms (> start-ms end-ms))
+      [false {::error (str "start-ms (" start-ms ") must be before end-ms (" end-ms ")")}]
+
+      :else true)))
+
+(timers/deftimer [cook-scheduler handler fetch-jobs])
+(timers/deftimer [cook-scheduler handler list-endpoint])
+(histograms/defhistogram [cook-mesos api list-request-param-time-range-ms])
+(histograms/defhistogram [cook-mesos api list-request-param-limit])
+(histograms/defhistogram [cook-mesos api list-response-job-count])
+
+(defn list-jobs
+  "Queries using the params from ctx and returns the job uuids that were found"
+  [db include-custom-executor? ctx]
+  (timers/time!
+    list-endpoint
+    (let [{states ::states
+           user ::user
+           start-ms ::start-ms
+           end-ms ::end-ms
+           since-hours-ago ::since-hours-ago
+           limit ::limit
+           name-filter-fn ::name-filter-fn} ctx
+          start-ms' (or start-ms (- end-ms (-> since-hours-ago t/hours t/in-millis)))
+          start (Date. ^long start-ms')
+          end (Date. ^long end-ms)
+          job-uuids (->> (timers/time!
+                           fetch-jobs
+                           (util/get-jobs-by-user-and-states db user states start end limit
+                                                             name-filter-fn include-custom-executor?))
+                         (sort-by :job/submit-time)
+                         reverse
+                         (map :job/uuid))
+          job-uuids (if (nil? limit)
+                      job-uuids
+                      (take limit job-uuids))]
+      (histograms/update! list-request-param-time-range-ms (- end-ms start-ms'))
+      (histograms/update! list-request-param-limit limit)
+      (histograms/update! list-response-job-count (count job-uuids))
+      job-uuids)))
+
+(defn jobs-list-exist?
+  [conn ctx]
+  [true {::jobs (list-jobs (d/db conn) true ctx)}])
 
 (defn read-jobs-handler
   [conn is-authorized-fn resource-attrs]
   (base-cook-handler
     (merge {:allowed-methods [:get]
-            :malformed? job-request-malformed?
-            :allowed? (partial job-request-allowed? conn is-authorized-fn)
-            :exists? (partial jobs-exist? conn)}
+            :malformed? (fn [ctx]
+                          (if (get-in ctx [:request :params :uuid])
+                            (job-request-malformed? ctx)
+                            (job-list-request-malformed? ctx)))
+            :allowed? (fn [ctx]
+                        (if (get-in ctx [:request :params :uuid])
+                          (job-request-allowed? conn is-authorized-fn ctx)
+                          (job-list-request-allowed? is-authorized-fn ctx)))
+            :exists? (fn [ctx]
+                       (if (get-in ctx [:request :params :uuid])
+                         (jobs-exist? conn ctx)
+                         (jobs-list-exist? conn ctx)))}
            resource-attrs)))
 
 (defn read-jobs-handler-multiple
-  [conn framework-id is-authorized-fn retrieve-sandbox-directory-from-agent]
-  (let [handle-ok (partial render-jobs-for-response conn framework-id retrieve-sandbox-directory-from-agent)]
+  [conn framework-id is-authorized-fn]
+  (let [handle-ok (partial render-jobs-for-response conn framework-id)]
     (read-jobs-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
 (defn read-jobs-handler-single
-  [conn framework-id is-authorized-fn retrieve-sandbox-directory-from-agent]
+  [conn framework-id is-authorized-fn]
   (let [handle-ok
         (fn handle-ok [ctx]
           (first
-            (render-jobs-for-response conn framework-id retrieve-sandbox-directory-from-agent ctx)))]
+            (render-jobs-for-response conn framework-id ctx)))]
     (read-jobs-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
 (defn instance-request-exists?
@@ -1201,13 +1337,13 @@
            resource-attrs)))
 
 (defn read-instances-handler-multiple
-  [conn framework-id is-authorized-fn retrieve-sandbox-directory-from-agent]
-  (let [handle-ok (partial render-instances-for-response conn framework-id retrieve-sandbox-directory-from-agent)]
+  [conn framework-id is-authorized-fn]
+  (let [handle-ok (partial render-instances-for-response conn framework-id)]
     (base-read-instances-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
 (defn read-instances-handler-single
-  [conn framework-id is-authorized-fn retrieve-sandbox-directory-from-agent]
-  (let [handle-ok (->> (partial render-instances-for-response conn framework-id retrieve-sandbox-directory-from-agent)
+  [conn framework-id is-authorized-fn]
+  (let [handle-ok (->> (partial render-instances-for-response conn framework-id)
                        (comp first))]
     (base-read-instances-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
@@ -1230,12 +1366,14 @@
     x
     [x]))
 
+(meters/defmeter [cook-mesos scheduler jobs-created])
+
 (defn create-jobs!
   "Based on the context, persists the specified jobs, along with their groups,
   to Datomic.
   Preconditions:  The context must already have been populated with both
   ::jobs and ::groups, which specify the jobs and job groups."
-  [conn {:keys [::groups ::jobs] :as ctx}]
+  [conn {:keys [::groups ::jobs ::pool]}]
   (try
     (log/info "Submitting jobs through raw api:" jobs)
     (let [group-uuids (set (map :uuid groups))
@@ -1250,7 +1388,7 @@
                                (map make-default-group))
           groups (into (vec implicit-groups) groups)
           job-asserts (map (fn [j] [:entity/ensure-not-exists [:job/uuid (:uuid j)]]) jobs)
-          job-txns (mapcat make-job-txn jobs)
+          job-txns (mapcat (partial make-job-txn pool) jobs)
           job-uuids->dbids (->> job-txns
                                 ;; Not all txns are for the top level job
                                 (filter :job/uuid)
@@ -1272,6 +1410,7 @@
              (into job-txns)
              (into group-txns)))
 
+      (meters/mark! jobs-created (count jobs))
       {::results (str/join
                    \space (concat ["submitted jobs"]
                                   (map (comp str :uuid) jobs)
@@ -1291,6 +1430,33 @@
       true
       [false {::error "You are not authorized to create jobs"}])))
 
+(defn no-job-exceeds-quota?
+  "Check if any of the submitted jobs exceed the user's total quota,
+   in which case the job would never be schedulable (unless the quota is increased).
+
+   If none of the jobs individually seem to exceed the user's quota, returns true;
+   otherwise, the following error structure is returned:
+
+     [false {::error \"...\"}]
+
+  where \"...\" is a detailed error string describing the quota bounds exceeded."
+  [conn {:keys [::jobs ::pool] :as ctx}]
+  (let [db (db conn)
+        resource-keys [:cpus :mem :gpus]
+        user (get-in ctx [:request :authorization/user])
+        user-quota (quota/get-quota db user (:pool/name pool))
+        errors (for [job jobs
+                     resource resource-keys
+                     :let [job-usage (-> job (get resource 0) double)
+                           quota-val (-> user-quota (get resource) double)]
+                     :when (> job-usage quota-val)]
+                 (format "Job %s exceeds quota for %s: %f > %f"
+                         (:uuid job) (name resource) job-usage quota-val))]
+    (cond
+      (zero? (:count user-quota)) [false {::error "User quota is set to zero jobs."}]
+      (seq errors) [false {::error (str/join "\n" errors)}]
+      :else true)))
+
 ;;; On POST; JSON blob that looks like:
 ;;; {"jobs": [{"command": "echo hello world",
 ;;;            "uuid": "123898485298459823985",
@@ -1307,12 +1473,21 @@
                          jobs (get params :jobs)
                          groups (get params :groups)
                          user (get-in ctx [:request :authorization/user])
-                         override-group-immutability? (boolean (get params :override-group-immutability))]
+                         override-group-immutability? (boolean (get params :override-group-immutability))
+                         pool-name (get params :pool)
+                         pool (when pool-name (d/entity (d/db conn) [:pool/name pool-name]))]
                      (try
                        (cond
                          (empty? params)
                          [true {::error (str "Must supply at least one job or group to start."
                                              "Are you specifying that this is application/json?")}]
+
+                         (and pool-name (not pool))
+                         [true {::error (str pool-name " is not a valid pool name.")}]
+
+                         (and pool (not (pool/accepts-submissions? pool)))
+                         [true {::error (str pool-name " is not accepting job submissions.")}]
+
                          :else
                          (let [groups (mapv #(validate-and-munge-group (db conn) %) groups)
                                jobs (mapv #(validate-and-munge-job
@@ -1324,7 +1499,9 @@
                                              %
                                              :override-group-immutability?
                                              override-group-immutability?) jobs)]
-                           [false {::groups groups ::jobs jobs}]))
+                           [false {::groups groups
+                                   ::jobs jobs
+                                   ::pool pool}]))
                        (catch Exception e
                          (log/warn e "Malformed raw api request")
                          [true {::error (.getMessage e)}]))))
@@ -1333,7 +1510,9 @@
                 (let [db (d/db conn)
                       existing (filter (partial job-exists? db) (map :uuid (::jobs ctx)))]
                   [(seq existing) {::existing existing}]))
-
+     ;; We want to return a 422 (unprocessable entity) if the requested resources
+     ;; for a single job exceed the user's total resource quota.
+     :processable? (partial no-job-exceeds-quota? conn)
      ;; To ensure compatibility with existing clients,
      ;; we need to return 409 (conflict) when a client POSTs a Job UUID that already exists.
      ;; Liberator normally only supports 409 responses to PUT requests, so we need to override
@@ -1353,7 +1532,11 @@
 
      :post! (partial create-jobs! conn)
      :handle-exception (fn [{:keys [exception]}]
-                         {:error (str "Exception occurred while creating job - " (.getMessage exception))})
+                         (if (datomic/transaction-timeout? exception)
+                           {:error (str "Transaction timed out."
+                                        " Your jobs may not have been created successfully."
+                                        " Please query your jobs and check whether they were created successfully.")}
+                           {:error (str "Exception occurred while creating job - " (.getMessage exception))}))
      :handle-created (fn [ctx] (::results ctx))}))
 
 (defn retrieve-groups
@@ -1436,7 +1619,7 @@
 ;;
 ;; /queue
 
-(def leader-hostname-regex #"^([^#]*)#([0-9]*)#.*")
+(def leader-hostname-regex #"^([^#]*)#([0-9]*)#([a-z]*)#.*")
 
 (defn waiting-jobs
   [mesos-pending-jobs-fn is-authorized-fn mesos-leadership-atom leader-selector]
@@ -1469,8 +1652,9 @@
                                  leader-match (re-matcher leader-hostname-regex leader-id)]
                              (if (.matches leader-match)
                                (let [leader-hostname (.group leader-match 1)
-                                     leader-port (.group leader-match 2)]
-                                 [true {:location (str "http://" leader-hostname ":" leader-port "/queue")}])
+                                     leader-port (.group leader-match 2)
+                                     leader-protocol (.group leader-match 3)]
+                                 [true {:location (str leader-protocol "://" leader-hostname ":" leader-port "/queue")}])
                                (throw (IllegalStateException.
                                        (str "Unable to parse leader id: " leader-id)))))))
    :handle-forbidden (fn [ctx]
@@ -1660,6 +1844,13 @@
                              jobs)))
       [true {::error (str "Increment would exceed the maximum retry limit of " retry-limit)}]
 
+      (and retries (let [db (d/db conn)]
+                     (some (fn [job]
+                             (> (d/invoke db :job/attempts-consumed db (d/entity db [:job/uuid job]))
+                                retries))
+                           jobs)))
+      [true {::error (str "Retries would be less than attempts-consumed")}]
+
       :else
       (let [db (d/db conn)
             group-jobs (for [guuid groups
@@ -1696,6 +1887,27 @@
                                (str/join \space))}])
         true)))
 
+(defn check-retry-conflict
+  "Checks whether a 409 conflict should be returned during a retry operation. This should occur when one of the jobs:
+   - Is already completed and has already retried 'retries' times
+   - Is not completed and already has 'retries' max-retries"
+  [conn ctx]
+  (let [jobs (::jobs ctx)
+        retries (get-in ctx [:request :body-params :retries])
+        db (d/db conn)]
+    (if (not (nil? retries))
+      (let [jobs-not-updated (filter (fn [uuid]
+                                       (let [{:keys [job/state job/max-retries] :as job} (d/entity db [:job/uuid uuid])]
+                                         (or (and (not (= :job.state/completed state))
+                                                  (= retries max-retries))
+                                             (and (= :job.state/completed state)
+                                                  (<= retries (d/invoke db :job/attempts-consumed db job))))))
+                                     jobs)]
+        (if (not (empty? jobs-not-updated))
+          [true {::error (str "Jobs will not retry: " (str/join ", " jobs-not-updated))}]
+          false))
+      false))) ; no conflict when incrementing
+
 (defn base-retries-handler
   [conn is-authorized-fn liberator-attrs]
   (base-cook-handler
@@ -1729,6 +1941,7 @@
      ;; actually an idempotent update; it should be PUT).
      :exists? (partial check-jobs-and-groups-exist conn)
      :malformed? (partial validate-retries conn task-constraints)
+     :conflict? (partial check-retry-conflict conn)
      :handle-created (partial display-retries conn)
      :post! (partial retry-jobs! conn)}))
 
@@ -1739,6 +1952,7 @@
     {:allowed-methods [:put]
      :malformed? (partial validate-retries conn task-constraints)
      :exists? (partial check-jobs-and-groups-exist conn)
+     :conflict? (partial check-retry-conflict conn)
      :put! (partial retry-jobs! conn)
      ;; :new? decides whether to respond with Created (true) or OK (false).
      :new? (comp seq ::jobs)
@@ -1751,21 +1965,23 @@
 ;; /share and /quota
 (def UserParam {:user s/Str})
 (def ReasonParam {:reason s/Str})
-(def UserLimitChangeParams (merge UserParam ReasonParam))
+(def UserLimitChangeParams (merge {(s/optional-key :pool) s/Str} UserParam ReasonParam))
 
 (def UserLimitsResponse
   {String s/Num})
 
 (defn set-limit-params
   [limit-type]
-  {:body-params (merge UserLimitChangeParams {limit-type {s/Keyword s/Num}})})
+  {:body-params (merge UserLimitChangeParams {limit-type {s/Keyword NonNegNum}})})
 
 (defn retrieve-user-limit
   [get-limit-fn conn ctx]
-  (->> (or (get-in ctx [:request :query-params :user])
-           (get-in ctx [:request :body-params :user]))
-       (get-limit-fn (db conn))
-       walk/stringify-keys))
+  (let [user (or (get-in ctx [:request :query-params :user])
+                 (get-in ctx [:request :body-params :user]))
+        pool (or (get-in ctx [:request :query-params :pool])
+                 (get-in ctx [:request :body-params :pool]))]
+    (->> (get-limit-fn (db conn) user pool)
+         walk/stringify-keys)))
 
 (defn check-limit-allowed
   [limit-type is-authorized-fn ctx]
@@ -1796,6 +2012,7 @@
      :delete! (fn [ctx]
                 (retract-limit-fn conn
                                   (get-in ctx [:request :query-params :user])
+                                  (get-in ctx [:request :query-params :pool])
                                   (get-in ctx [:request :query-params :reason])))}))
 
 (defn coerce-limit-values
@@ -1828,6 +2045,7 @@
               (apply set-limit-fn
                      conn
                      (get-in ctx [:request :body-params :user])
+                     (get-in ctx [:request :body-params :pool])
                      (get-in ctx [:request :body-params :reason])
                      (reduce into [] (::limits ctx))))}))
 
@@ -1848,40 +2066,77 @@
   "Helper-schema for :ungrouped jobs in UserUsageResponse."
   {:running_jobs [s/Uuid], :usage UsageInfo})
 
-(def UserUsageResponse
-  "Schema for a usage response."
+(def UserUsageInPool
+  "Schema for a user's usage within a particular pool."
   {:total_usage UsageInfo
    (s/optional-key :grouped) [{:group UsageGroupInfo, :usage UsageInfo}]
    (s/optional-key :ungrouped) JobsUsageResponse})
+
+(def UserUsageResponse
+  "Schema for a usage response."
+  (assoc UserUsageInPool
+    (s/optional-key :pools) {s/Str UserUsageInPool}))
 
 (def zero-usage
   "Resource usage map 'zero' value"
   (util/total-resources-of-jobs nil))
 
+(defn user-usage
+  "Given a collection of jobs, returns the usage information for those jobs."
+  [with-group-breakdown? jobs]
+  (merge
+    ; basic user usage response
+    {:total-usage (util/total-resources-of-jobs jobs)}
+    ; (optional) user's total usage with breakdown by job groups
+    (when with-group-breakdown?
+      (let [breakdowns (->> jobs
+                            (group-by util/job-ent->group-uuid)
+                            (map-vals (juxt #(mapv :job/uuid %)
+                                            util/total-resources-of-jobs
+                                            #(-> % first :group/_job first))))]
+        {:grouped (for [[guuid [job-uuids usage group]] breakdowns
+                        :when guuid]
+                    {:group {:uuid (:group/uuid group)
+                             :name (:group/name group)
+                             :running-jobs job-uuids}
+                     :usage usage})
+         :ungrouped (let [[job-uuids usage] (get breakdowns nil)]
+                      {:running-jobs job-uuids
+                       :usage (or usage zero-usage)})}))))
+
+(defn no-usage-map
+  "Returns a resource usage map showing no usage"
+  [with-group-breakdown?]
+  (cond-> {:total-usage zero-usage}
+          with-group-breakdown? (assoc :grouped []
+                                       :ungrouped {:running-jobs []
+                                                   :usage zero-usage})))
+
 (defn get-user-usage
   "Query a user's current resource usage based on running jobs."
   [db ctx]
   (let [user (get-in ctx [:request :query-params :user])
-        running-jobs (util/get-user-running-job-ents db user)
-        with-group-breakdown? (get-in ctx [:request :query-params :group_breakdown])]
-    (merge
-      ; basic user usage response
-      {:total-usage (util/total-resources-of-jobs running-jobs)}
-      ; (optional) user's total usage with breakdown by job groups
-      (when with-group-breakdown?
-        (let [breakdowns (->> running-jobs
-                              (group-by util/job-ent->group-uuid)
-                              (map-vals (juxt #(mapv :job/uuid %)
-                                              util/total-resources-of-jobs
-                                              #(-> % first :group/_job first))))]
-          {:grouped (for [[guuid [job-uuids usage group]] breakdowns
-                          :when guuid]
-                      {:group {:uuid (:group/uuid group)
-                               :name (:group/name group)
-                               :running-jobs job-uuids}
-                       :usage usage})
-           :ungrouped (let [[job-uuids usage] (get breakdowns nil)]
-                        {:running-jobs job-uuids :usage (or usage zero-usage)})})))))
+        with-group-breakdown? (get-in ctx [:request :query-params :group_breakdown])
+        pool (get-in ctx [:request :query-params :pool])]
+    (if pool
+      (let [jobs (util/get-user-running-job-ents-in-pool db user pool)]
+        (user-usage with-group-breakdown? jobs))
+      (let [jobs (util/get-user-running-job-ents db user)
+            pools (pool/all-pools db)]
+        (if (pos? (count pools))
+          (let [default-pool-name (config/default-pool)
+                pool-name->jobs (group-by
+                                  #(if-let [pool (:job/pool %)]
+                                     (:pool/name pool)
+                                     default-pool-name)
+                                  jobs)
+                no-usage (no-usage-map with-group-breakdown?)
+                pool-name->usage (map-vals (partial user-usage with-group-breakdown?) pool-name->jobs)
+                pool-name->no-usage (into {} (map (fn [{:keys [pool/name]}] [name no-usage]) pools))
+                default-pool-usage (get pool-name->usage default-pool-name no-usage)]
+            (assoc default-pool-usage
+              :pools (merge pool-name->no-usage pool-name->usage)))
+          (user-usage with-group-breakdown? jobs))))))
 
 (defn read-usage-handler
   "Handle GET requests for a user's current usage."
@@ -1934,7 +2189,7 @@
     (instance? Minutes v) (str v)
     (instance? ServerSocket v) (str v)
     (instance? Var v) (str v)
-    (instance? RiemannReporter v) (str v)
+    (instance? ScheduledReporter v) (str v)
     :else v))
 
 (defn settings-handler
@@ -1943,70 +2198,25 @@
     {:allowed-methods [:get]
      :handle-ok (fn [_] (stringify settings))}))
 
-(defn- parse-int-default
-  [s d]
-  (if (nil? s)
-    d
-    (Integer/parseInt s)))
-
 (defn- parse-long-default
   [s d]
   (if (nil? s)
     d
     (Long/parseLong s)))
 
-(timers/deftimer [cook-scheduler handler fetch-jobs])
-(timers/deftimer [cook-scheduler handler list-endpoint])
-(histograms/defhistogram [cook-mesos api list-request-param-time-range-ms])
-(histograms/defhistogram [cook-mesos api list-request-param-limit])
-(histograms/defhistogram [cook-mesos api list-response-job-count])
-
-(defn normalize-list-states
-  "Given a set, states, returns a new set that only contains one of the
-  'terminal' states of completed, success, and failed. We take completed
-  to mean both success and failed."
-  [states]
-  (if (contains? states "completed")
-    (set/difference states util/instance-states)
-    (if (set/superset? states util/instance-states)
-      (-> states (set/difference util/instance-states) (conj "completed"))
-      states)))
-
-(defn valid-name-filter?
-  "Returns true if the provided name filter is either nil or satisfies the JobNameListFilter schema"
-  [name]
-  (or (nil? name)
-      (nil? (s/check JobNameListFilter name))))
-
-(defn name-filter-str->name-filter-pattern
-  "Generates a regex pattern corresponding to a user-provided name filter string"
-  [name]
-  (re-pattern (-> name
-                  (str/replace #"\." "\\\\.")
-                  (str/replace #"\*+" ".*"))))
-
-(defn name-filter-str->name-filter-fn
-  "Returns a name-filtering function (or nil) given a user-provided name filter string"
-  [name]
-  (when name
-    (let [pattern (name-filter-str->name-filter-pattern name)]
-      #(re-matches pattern %))))
-
 (defn list-resource
-  [db framework-id is-authorized-fn retrieve-sandbox-directory-from-agent]
+  [db framework-id is-authorized-fn]
   (liberator/resource
     :available-media-types ["application/json"]
     :allowed-methods [:get]
-    :as-response (fn [data ctx] {:body data})
+    :as-response (fn [data _] {:body data})
     :malformed? (fn [ctx]
                   ;; since-hours-ago is included for backwards compatibility but is deprecated
                   ;; please use start-ms and end-ms instead
-                  (let [{:keys [state user since-hours-ago start-ms end-ms limit name]
-                         :as params}
+                  (let [{:keys [state user since-hours-ago start-ms end-ms limit name]}
                         (keywordize-keys (or (get-in ctx [:request :query-params])
                                              (get-in ctx [:request :body-params])))
-                        states (when state (set (str/split state #"\+")))
-                        allowed-list-states (set/union util/job-states util/instance-states)]
+                        states (when state (set (str/split state #"\+")))]
                     (cond
                       (not (and state user))
                       [true {::error "must supply the state and the user name"}]
@@ -2023,9 +2233,9 @@
                       (try
                         [false {::states (normalize-list-states states)
                                 ::user user
-                                ::since-hours-ago (parse-int-default since-hours-ago 24)
+                                ::since-hours-ago (util/parse-int-default since-hours-ago 24)
                                 ::start-ms (parse-long-default start-ms nil)
-                                ::limit (parse-int-default limit Integer/MAX_VALUE)
+                                ::limit (util/parse-int-default limit Integer/MAX_VALUE)
                                 ::end-ms (parse-long-default end-ms (System/currentTimeMillis))
                                 ::name-filter-fn (name-filter-str->name-filter-fn name)}]
                         (catch NumberFormatException e
@@ -2055,32 +2265,10 @@
     :handle-malformed ::error
     :handle-forbidden ::error
     :handle-ok (fn [ctx]
-                (timers/time!
-                  list-endpoint
-                  (let [{states ::states
-                         user ::user
-                         start-ms ::start-ms
-                         end-ms ::end-ms
-                         since-hours-ago ::since-hours-ago
-                         limit ::limit
-                         name-filter-fn ::name-filter-fn} ctx
-                        start-ms' (or start-ms (- end-ms (-> since-hours-ago t/hours t/in-millis)))
-                        start (Date. start-ms')
-                        end (Date. end-ms)
-                        job-uuids (->> (timers/time!
-                                         fetch-jobs
-                                         (util/get-jobs-by-user-and-states db user states start end limit name-filter-fn))
-                                       (sort-by :job/submit-time)
-                                       reverse
-                                       (map :job/uuid))
-                        job-uuids (if (nil? limit)
-                                    job-uuids
-                                    (take limit job-uuids))
-                        jobs (mapv (partial fetch-job-map db framework-id retrieve-sandbox-directory-from-agent) job-uuids)]
-                    (histograms/update! list-request-param-time-range-ms (- end-ms start-ms'))
-                    (histograms/update! list-request-param-limit limit)
-                    (histograms/update! list-response-job-count (count jobs))
-                    jobs)))))
+                 (timers/time!
+                   (timers/timer ["cook-scheduler" "handler" "list-endpoint-duration"])
+                   (let [job-uuids (list-jobs db false ctx)]
+                     (mapv (partial fetch-job-map db framework-id) job-uuids))))))
 
 ;;
 ;; /unscheduled_jobs
@@ -2120,6 +2308,115 @@
                                   :reasons (job-reasons conn job)})
                        (::jobs ctx)))}))
 
+;;
+;; /stats/instances
+;;
+
+(def HistogramStats
+  {:percentiles {(s/required-key 50) s/Num
+                 (s/required-key 75) s/Num
+                 (s/required-key 95) s/Num
+                 (s/required-key 99) s/Num
+                 (s/required-key 100) s/Num}
+   :total NonNegNum})
+
+(def TaskStats
+  {(s/optional-key :count) NonNegInt
+   (s/optional-key :cpu-seconds) HistogramStats
+   (s/optional-key :mem-seconds) HistogramStats
+   (s/optional-key :run-time-seconds) HistogramStats})
+
+(def UserLeaders
+  {s/Str NonNegNum})
+
+(def TaskStatsResponse
+  {:by-reason {s/Any TaskStats}
+   :by-user-and-reason {s/Str {s/Any TaskStats}}
+   :leaders {:cpu-seconds UserLeaders
+             :mem-seconds UserLeaders}
+   :overall TaskStats})
+
+(def TaskStatsParams
+  {:status s/Str
+   :start s/Str
+   :end s/Str
+   (s/optional-key :name) s/Str})
+
+(timers/deftimer [cook-scheduler handler stats-instances-endpoint])
+
+(defn task-stats-handler
+  [conn is-authorized-fn]
+  (base-cook-handler
+    {:allowed-methods [:get]
+     :allowed?
+     (fn [ctx]
+       (let [user (get-in ctx [:request :authorization/user])
+             impersonator (get-in ctx [:request :authorization/impersonator])]
+         (if (is-authorized-fn user :read impersonator {:owner ::system :item :stats})
+           true
+           [false {::error "Unauthorized"}])))
+     :malformed?
+     (fn [ctx]
+       (let [{:keys [status start end name]} (-> ctx :request :params)
+             allowed-instance-statuses #{"unknown" "running" "success" "failed"}
+             start-time (util/parse-time start)
+             end-time (util/parse-time end)]
+         (cond
+           (not (allowed-instance-statuses status))
+           [true {::error (str "unsupported status " status ", must be one of: " allowed-instance-statuses)}]
+
+           (not (valid-name-filter? name))
+           [true {::error
+                  (str "unsupported name filter " name
+                       ", can only contain alphanumeric characters, '.', '-', '_', and '*' as a wildcard")}]
+
+           (not (t/after? end-time start-time))
+           [true {::error "end time must be after start time"}]
+
+           (< 31 (t/in-days (t/interval start-time end-time)))
+           [true {::error (str "time interval must be less than or equal to 31 days")}]
+
+           :else
+           (try
+             [false {::status (keyword "instance.status" status)
+                     ::start start-time
+                     ::end end-time
+                     ::name-filter-fn (name-filter-str->name-filter-fn name)}]
+             (catch NumberFormatException e
+               [true {::error (.toString e)}])))))
+     :handle-ok
+     (fn [ctx]
+       (timers/time!
+         stats-instances-endpoint
+         (let [{status ::status, start ::start, end ::end, name-filter-fn ::name-filter-fn} ctx]
+           (task-stats/get-stats conn status start end name-filter-fn))))}))
+
+;;
+;; /pools
+;;
+
+(def PoolsResponse
+  [{:name s/Str
+    :purpose s/Str
+    :state s/Str}])
+
+(defn pool-entity->consumable-map
+  "Converts the given pool entity to a 'consumable' map"
+  [e]
+  {:name (:pool/name e)
+   :purpose (:pool/purpose e)
+   :state (name (:pool/state e))})
+
+(defn pools-handler
+  "Handler for retrieving pools"
+  []
+  (base-cook-handler
+    {:allowed-methods [:get]
+     :handle-ok (fn [_]
+                  (let [db (d/db datomic/conn)]
+                    (->> (pool/all-pools db)
+                         (mapv pool-entity->consumable-map))))}))
+
 (defn- streaming-json-encoder
   "Takes as input the response body which can be converted into JSON,
   and returns a function which takes a ServletResponse and writes the JSON
@@ -2135,7 +2432,8 @@
   [handler]
   (fn streaming-json-handler [req]
     (let [{:keys [headers body] :as resp} (handler req)
-          json-response (or (= "application/json" (get headers "Content-Type"))
+          json-response (or (and (= "application/json" (get headers "Content-Type"))
+                                 (not (string? body)))
                             (coll? body))]
       (cond-> resp
         json-response (res/content-type "application/json")
@@ -2169,6 +2467,7 @@
                          JobResponse (partial map-keys ->snake_case)
                          GroupResponse (partial map-keys ->snake_case)
                          UserUsageResponse (partial map-keys ->snake_case)
+                         UserUsageInPool (partial map-keys ->snake_case)
                          UsageGroupInfo (partial map-keys ->snake_case)
                          JobsUsageResponse (partial map-keys ->snake_case)
                          s/Uuid str})]
@@ -2186,8 +2485,7 @@
     gpu-enabled? :mesos-gpu-enabled
     :as settings}
    leader-selector
-   mesos-leadership-atom
-   retrieve-sandbox-directory-from-agent]
+   mesos-leadership-atom]
   (->
     (routes
       (c-api/api
@@ -2208,10 +2506,9 @@
                                     :description "The jobs and their instances were returned."}
                                400 {:description "Non-UUID values were passed as jobs."}
                                403 {:description "The supplied UUIDs don't correspond to valid jobs."}}
-                   :handler (read-jobs-handler-deprecated conn framework-id is-authorized-fn
-                                                          retrieve-sandbox-directory-from-agent)}
-             :post {:summary "Schedules one or more jobs."
-                    :parameters {:body-params RawSchedulerRequest}
+                   :handler (read-jobs-handler-deprecated conn framework-id is-authorized-fn)}
+             :post {:summary "Schedules one or more jobs (deprecated)."
+                    :parameters {:body-params RawSchedulerRequestDeprecated}
                     :responses {201 {:description "The jobs were successfully scheduled."}
                                 400 {:description "One or more of the jobs were incorrectly specified."}
                                 409 {:description "One or more of the jobs UUIDs are already in use."}}
@@ -2232,8 +2529,7 @@
                                     :description "The job was returned."}
                                400 {:description "A non-UUID value was passed."}
                                403 {:description "The supplied UUID doesn't correspond to a valid job."}}
-                   :handler (read-jobs-handler-single conn framework-id is-authorized-fn
-                                                      retrieve-sandbox-directory-from-agent)}}))
+                   :handler (read-jobs-handler-single conn framework-id is-authorized-fn)}}))
 
         (c-api/context
           "/jobs" []
@@ -2244,8 +2540,13 @@
                                     :description "The jobs were returned."}
                                400 {:description "Non-UUID values were passed."}
                                403 {:description "The supplied UUIDs don't correspond to valid jobs."}}
-                   :handler (read-jobs-handler-multiple conn framework-id is-authorized-fn
-                                                        retrieve-sandbox-directory-from-agent)}}))
+                   :handler (read-jobs-handler-multiple conn framework-id is-authorized-fn)}
+             :post {:summary "Schedules one or more jobs."
+                    :parameters {:body-params JobSubmissionRequest}
+                    :responses {201 {:description "The jobs were successfully scheduled."}
+                                400 {:description "One or more of the jobs were incorrectly specified."}
+                                409 {:description "One or more of the jobs UUIDs are already in use."}}
+                    :handler (create-jobs-handler conn task-constraints gpu-enabled? is-authorized-fn)}}))
 
         (c-api/context
           "/info" []
@@ -2265,8 +2566,7 @@
                                     :description "The job instance was returned."}
                                400 {:description "A non-UUID value was passed."}
                                403 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
-                   :handler (read-instances-handler-single conn framework-id is-authorized-fn
-                                                           retrieve-sandbox-directory-from-agent)}}))
+                   :handler (read-instances-handler-single conn framework-id is-authorized-fn)}}))
 
         (c-api/context
           "/instances" []
@@ -2277,8 +2577,7 @@
                                     :description "The job instances were returned."}
                                400 {:description "Non-UUID values were passed."}
                                403 {:description "The supplied UUIDs don't correspond to valid job instances."}}
-                   :handler (read-instances-handler-multiple conn framework-id is-authorized-fn
-                                                             retrieve-sandbox-directory-from-agent)}}))
+                   :handler (read-instances-handler-multiple conn framework-id is-authorized-fn)}}))
 
         (c-api/context
           "/share" []
@@ -2405,13 +2704,35 @@
                    :responses {200 {:schema UnscheduledJobResponse
                                     :description "Reasons the job isn't being scheduled."}
                                400 {:description "Invalid request format."}
-                               404 {:description "The UUID doesn't correspond to a job."}}}})))
+                               404 {:description "The UUID doesn't correspond to a job."}}}}))
+
+        (c-api/context
+          "/stats/instances" []
+          (c-api/resource
+            {:produces ["application/json"],
+             :responses {200 {:schema TaskStatsResponse
+                              :description "Task stats calculated."}
+                         401 {:description "Not authorized to read stats."}
+                         403 {:description "Invalid request format."}}
+             :get {:summary "Query statistics for instances started in a time range."
+                   :parameters {:query-params TaskStatsParams}
+                   :handler (task-stats-handler conn is-authorized-fn)}}))
+
+        (c-api/context
+          "/pools" []
+          (c-api/resource
+            {:produces ["application/json"],
+             :responses {200 {:schema PoolsResponse
+                              :description "The pools were returned."}}
+             :get {:summary "Returns the pools."
+                   :handler (pools-handler)}})))
+
       (ANY "/queue" []
         (waiting-jobs mesos-pending-jobs-fn is-authorized-fn mesos-leadership-atom leader-selector))
       (ANY "/running" []
         (running-jobs conn is-authorized-fn))
       (ANY "/list" []
-        (list-resource (db conn) framework-id is-authorized-fn retrieve-sandbox-directory-from-agent)))
+        (list-resource (db conn) framework-id is-authorized-fn)))
     (format-params/wrap-restful-params {:formats [:json-kw]
                                         :handle-error c-mw/handle-req-error})
     (streaming-json-middleware)))

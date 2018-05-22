@@ -9,6 +9,7 @@ set -e
 
 # Defaults (overridable via environment)
 : ${COOK_PORT:=12321}
+: ${COOK_SSL_PORT:=12322}
 : ${COOK_NREPL_PORT:=8888}
 : ${COOK_FRAMEWORK_ID:=cook-framework-$(date +%s)}
 : ${COOK_AUTH:=one-user}
@@ -48,7 +49,7 @@ NAME=cook-scheduler-${COOK_PORT}
 
 if [ "$(docker ps -aq -f name=${NAME})" ]; then
     # Cleanup
-    docker rm ${NAME}
+    docker stop ${NAME}
 fi
 
 $(minimesos info | grep MINIMESOS)
@@ -90,7 +91,7 @@ fi
 
 if [ -z "${COOK_DATOMIC_URI}" ];
 then
-    COOK_DATOMIC_URI="datomic:mem://cook-jobs"
+    COOK_DATOMIC_URI="datomic:free://localhost:4334/cook-jobs"
 fi
 
 if [ "${COOK_ZOOKEEPER_LOCAL}" = false ] ; then
@@ -112,9 +113,15 @@ docker create \
     --name=${NAME} \
     --publish=${COOK_NREPL_PORT}:${COOK_NREPL_PORT} \
     --publish=${COOK_PORT}:${COOK_PORT} \
+    --publish=${COOK_SSL_PORT}:${COOK_SSL_PORT} \
+    --publish=4334:4334 \
+    --publish=4335:4335 \
+    --publish=4336:4336 \
     -e "COOK_EXECUTOR=file://${SCHEDULER_EXECUTOR_DIR}/${EXECUTOR_NAME}.tar.gz" \
     -e "COOK_EXECUTOR_COMMAND=${COOK_EXECUTOR_COMMAND}" \
     -e "COOK_PORT=${COOK_PORT}" \
+    -e "COOK_SSL_PORT=${COOK_SSL_PORT}" \
+    -e "COOK_KEYSTORE_PATH=${COOK_KEYSTORE_PATH}" \
     -e "COOK_NREPL_PORT=${COOK_NREPL_PORT}" \
     -e "COOK_FRAMEWORK_ID=${COOK_FRAMEWORK_ID}" \
     -e "MESOS_MASTER=${ZK}" \
@@ -125,18 +132,15 @@ docker create \
     -e "COOK_DATOMIC_URI=${COOK_DATOMIC_URI}" \
     -e "COOK_LOG_FILE=log/cook-${COOK_PORT}.log" \
     -e "COOK_HTTP_BASIC_AUTH=${COOK_HTTP_BASIC_AUTH:-false}" \
+    -e "COOK_ONE_USER_AUTH=root" \
     -e "COOK_EXECUTOR_PORTION=${COOK_EXECUTOR_PORTION:-0}" \
+    -e "COOK_KEYSTORE_PATH=/opt/ssl/cook.p12" \
     -v ${DIR}/../log:/opt/cook/log \
     cook-scheduler:latest ${COOK_CONFIG:-}
 
 docker network connect bridge ${NAME}
 docker network connect cook_nw ${NAME}
-docker start -ai ${NAME}
+docker start ${NAME}
 
-# If Cook is not starting, you may be able to troubleshoot by
-# adding the following line right after the `docker run` line:
-#
-#    --entrypoint=/bin/bash \
-#
-# This will override the ENTRYPOINT baked into the Dockerfile
-# and instead give you an interactive bash shell.
+echo "Attaching to container..."
+docker attach ${NAME}

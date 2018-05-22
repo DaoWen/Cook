@@ -180,6 +180,12 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/cardinality :db.cardinality/one
     :db.install/_attribute :db.part/db
     :db/doc "Whether a summary of Fenzo placement failures should be recorded for the job at next opportunity."}
+   {:db/id (d/tempid :db.part/db)
+    :db/ident :job/pool
+    :db/doc "Cook schedules jobs independently between pools. Each pool supports different quotas, shares, etc."
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db.install/_attribute :db.part/db}
    ;; Group attributes
    {:db/id (d/tempid :db.part/db)
     :db/ident :group/uuid
@@ -483,6 +489,12 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/valueType :db.type/boolean
     :db/cardinality :db.cardinality/one
     :db.install/_attribute :db.part/db}
+   {:db/id (d/tempid :db.part/db)
+    :db/ident :resource/pool
+    :db/doc "Each resource can have different values per pool"
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db.install/_attribute :db.part/db}
    ;; Instance attributes
    {:db/id (d/tempid :db.part/db)
     :db/ident :instance/task-id
@@ -615,6 +627,7 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one
     :db.install/_attribute :db.part/db}
+   
 
    ;; Quota attributes
    {:db/id (d/tempid :db.part/db)
@@ -681,7 +694,27 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one
     :db.install/_attribute :db.part/db}
-   ])
+
+   ;; Pool entity
+   {:db/id (d/tempid :db.part/db)
+    :db/ident :pool/name
+    :db/doc "The name of the pool."
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity
+    :db.install/_attribute :db.part/db}
+   {:db/id (d/tempid :db.part/db)
+    :db/ident :pool/purpose
+    :db/doc "The purpose of the pool (e.g. 'For jobs that can support preemptible VMs')."
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db.install/_attribute :db.part/db}
+   {:db/id (d/tempid :db.part/db)
+    :db/ident :pool/state
+    :db/doc "The state of the pool."
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db.install/_attribute :db.part/db}])
 
 (def migration-add-index-to-job-state
   "This was written on 9-26-2014"
@@ -765,6 +798,8 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :resource.type/mesos-name :gpus}
    {:db/id (d/tempid :db.part/user)
     :db/ident :resource.type/uri}
+   {:db/id (d/tempid :db.part/user)
+    :db/ident :resource.type/count}
    ;; Functions for database manipulation
    {:db/id (d/tempid :db.part/user)
     :db/ident :instance/create
@@ -778,7 +813,14 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/doc "Signals intent to use the custom executor"}
    {:db/id (d/tempid :db.part/user)
     :db/ident :executor/mesos
-    :db/doc "Signals intent to use the Mesos command executor"}])
+    :db/doc "Signals intent to use the Mesos command executor"}
+   ;; Pool states
+   {:db/id (d/tempid :db.part/user)
+    :db/ident :pool.state/active
+    :db/doc "Signifies that the pool is active."}
+   {:db/id (d/tempid :db.part/user)
+    :db/ident :pool.state/inactive
+    :db/doc "Signifies that the pool is inactive and should not be used."}])
 
 (def straggler-handling-types
   (->> schema-attributes
@@ -825,14 +867,15 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
     :db/ident :job/reasons->attempts-consumed
     :db/doc "Determines the amount of attempts consumed by a collection of failure reasons."
     :db/fn #db/fn {:lang "clojure"
-                   :params [mea-culpa-limit reasons]
+                   :params [mea-culpa-limit disable-mea-culpa-retries reasons]
                    :code
                    (->> reasons
                         frequencies
                         (map (fn [[reason count]]
                                ;; Note a nil reason counts as a non-mea-culpa failure!
                                (if (:reason/mea-culpa? reason)
-                                 (let [failure-limit (or (:reason/failure-limit reason)
+                                 (let [failure-limit (or (when disable-mea-culpa-retries 0)
+                                                         (:reason/failure-limit reason)
                                                          mea-culpa-limit)]
                                    (if (= failure-limit -1)
                                      0 ; -1 means no failure limit
@@ -847,16 +890,16 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
                    :params [db job-ent]
                    :code
                    (let [done-statuses #{:instance.status/success :instance.status/failed}
-                         mea-culpa-limit (or (when (:job/disable-mea-culpa-retries job-ent)
-                                               0)
-                                             (:scheduler.config/mea-culpa-failure-limit
-                                               (d/entity db :scheduler/config))
+                         mea-culpa-limit (or (:scheduler.config/mea-culpa-failure-limit (d/entity db :scheduler/config))
                                              5)]
                      (->> job-ent
                           :job/instance
                           (filter #(done-statuses (:instance/status %)))
                           (map :instance/reason)
-                          (d/invoke db :job/reasons->attempts-consumed mea-culpa-limit)))}}
+                          (d/invoke db
+                                    :job/reasons->attempts-consumed
+                                    mea-culpa-limit
+                                    (:job/disable-mea-culpa-retries job-ent))))}}
 
    {:db/id (d/tempid :db.part/user)
     :db/ident :job/all-attempts-consumed?
@@ -1013,7 +1056,31 @@ for a job. E.g. {:resources {:cpus 4 :mem 3} :constraints {\"unique_host_constra
                    (let [j (d/entity db id-or-lookup)]
                      (when j
                        (throw (IllegalStateException.
-                               (str "Entity with id " id-or-lookup " already exists.")))))}}])
+                               (str "Entity with id " id-or-lookup " already exists.")))))}}
+   {:db/id (d/tempid :db.part/user)
+    :db/ident :job/update-retry-count
+    :db/doc "Updates a job's max-retries"
+    :db/fn #db/fn {:lang "clojure"
+                   :params [db job-entity-id retries]
+                   :code
+                   (let [job-ent (d/entity db job-entity-id)
+                         attempts-consumed (d/invoke db :job/attempts-consumed db job-ent)]
+                     (if (<= attempts-consumed retries)
+                       [[:db/add job-entity-id :job/max-retries retries]]
+                       (throw (IllegalStateException.
+                               (str "Attempted to change retries from " (:job/max-retries job-ent) " to " retries)))))}}
+   {:db/id (d/tempid :db.part/user)
+    :db/ident :job/update-state-on-retry
+    :db/doc "Updates a jobs state on retry"
+    :db/fn #db/fn {:lang "clojure"
+                   :params [db job-entity-id retries]
+                   :code
+                   (let [job-ent (d/entity db job-entity-id)
+                         attempts-consumed (d/invoke db :job/attempts-consumed db job-ent)]
+                     (if (and (= :job.state/completed (:job/state job-ent))
+                              (< attempts-consumed retries))
+                       [[:db/add job-entity-id :job/state :job.state/waiting]]
+                       []))}}])
 
 (def reason-entities
   [{:db/id (d/tempid :db.part/user)

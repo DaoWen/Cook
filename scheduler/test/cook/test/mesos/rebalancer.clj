@@ -21,11 +21,14 @@
             [cook.mesos :as mesos]
             [cook.mesos.dru :as dru]
             [cook.mesos.rebalancer :as rebalancer :refer (->State)]
+            [cook.mesos.scheduler :as sched]
             [cook.mesos.share :as share]
             [cook.mesos.util :as util]
             [cook.test.testutil :refer (restore-fresh-database! create-dummy-job create-dummy-instance
                                                                 create-dummy-group init-offer-cache)]
-            [datomic.api :as d :refer (q)]))
+            [datomic.api :as d :refer (q)])
+  (:import [com.netflix.fenzo SimpleAssignmentResult
+                              TaskRequest]))
 
 (defn create-running-job
   [conn host & args]
@@ -74,7 +77,7 @@
 
           tasks (shuffle [task-ent1 task-ent2 task-ent3 task-ent4
                            task-ent5 task-ent6 task-ent7 task-ent8])]
-      (let [_ (share/set-share! conn "default"
+      (let [_ (share/set-share! conn "default" nil
                                 "Limits for new cluster"
                                 :mem 25.0 :cpus 25.0 :gpus 1.0)
             scored-task1 (dru/->ScoredTask task-ent1 0.4 10.0 10.0)
@@ -136,7 +139,7 @@
           task-ent7 (d/entity (d/db conn) task7)
           task-ent8 (d/entity (d/db conn) task8)
 
-          _ (share/set-share! conn "default"
+          _ (share/set-share! conn "default" nil
                               "limits for new cluster"
                               :mem 25.0 :cpus 25.0 :gpus 1.0)
 
@@ -182,7 +185,7 @@
         task-ent7 (d/entity (d/db conn) task7)
         task-ent8 (d/entity (d/db conn) task8)
 
-        _ (share/set-share! conn "default"
+        _ (share/set-share! conn "default" nil
                             "limits for new cluster"
                             :mem 25.0 :cpus 25.0 :gpus 1.0)
 
@@ -268,7 +271,7 @@
           task-ent7 (d/entity (d/db conn) task7)
           task-ent8 (d/entity (d/db conn) task8)
 
-          _ (share/set-share! conn "default"
+          _ (share/set-share! conn "default" nil
                               "limits for new cluster"
                               :mem 25.0 :cpus 25.0 :gpus 1.0)
 
@@ -455,7 +458,7 @@
                        "rebar" {"HOSTNAME" "rebar"}}
           offer-cache (init-offer-cache)
           cotask-cache (atom (cache/fifo-cache-factory {} :threshold 100))]
-      (share/set-share! conn "default" "new cluster settings"
+      (share/set-share! conn "default" nil "new cluster settings"
                         :mem 10.0 :cpus 10.0 :gpus 10.0)
       ; Fill up hosts with preemptable tasks
       (doall (for [[user host] user->host]
@@ -538,7 +541,7 @@
                        "rebar" {"HOSTNAME" "rebar"}}
           offer-cache (init-offer-cache)
           cotask-cache (atom (cache/fifo-cache-factory {} :threshold 100))]
-      (share/set-share! conn "default" "new cluster settings"
+      (share/set-share! conn "default" nil "new cluster settings"
                         :mem 10.0 :cpus 10.0 :gpus 1.0)
       ; Fill up hosts with preemptable tasks
       (doall (for [[user host] user->host]
@@ -600,7 +603,7 @@
                            "rebar" {"az" "west" "HOSTNAME" "rebar"}}
           offer-cache (init-offer-cache)
           cotask-cache (atom (cache/fifo-cache-factory {} :threshold 100))]
-      (share/set-share! conn "default" "new cluster limits"
+      (share/set-share! conn "default" nil "new cluster limits"
                         :mem 10.0 :cpus 10.0 :gpus 1.0)
       ; Fill up hosts with preemptable tasks
       (doall (for [[user host] user->host]
@@ -678,7 +681,7 @@
 
       (testing "try placing job with one unconstrained-host available"
         (let [conn (restore-fresh-database! datomic-uri)
-              _ (share/set-share! conn "default""new cluster limits"
+              _ (share/set-share! conn "default" nil "new cluster limits"
                                   :mem 20.0 :cpus 20.0 :gpus 1.0)
               offer-cache (init-offer-cache)
               ; Fill up hosts with preemptable tasks
@@ -714,7 +717,7 @@
 
       (testing "try placing job with two unconstrained hosts available, but one has already been preempted this cycle"
         (let [conn (restore-fresh-database! datomic-uri)
-              _ (share/set-share! conn "default" "new cluster limits"
+              _ (share/set-share! conn "default" nil "new cluster limits"
                                   :mem 20.0 :cpus 20.0 :gpus 1.0)
               offer-cache (init-offer-cache)
               ; Fill up hosts with preemptable tasks
@@ -811,7 +814,7 @@
                                              :instance-status :instance.status/running
                                              :slave-id "testB"
                                              :hostname "hostB")
-          _ (share/set-share! conn "default"
+          _ (share/set-share! conn "default" nil
                               "limits for new cluster"
                               :mem 25.0 :cpus 25.0 :gpus 1.0)
           db (d/db conn)
@@ -979,7 +982,7 @@
                                      job8
                                      :instance-status :instance.status/running
                                      :hostname "hostB")
-        _ (share/set-share! conn "default"
+        _ (share/set-share! conn "default" nil
                             "limits for new cluster"
                             :mem 25.0 :cpus 25.0)
 
@@ -1060,7 +1063,7 @@
          test-cases]
   (testing test-name
     (doseq [{:keys [user mem cpus]} share-updates]
-      (share/set-share! conn user
+      (share/set-share! conn user nil
                         "test update"
                         :mem mem :cpus cpus))
     (let [db (d/db conn)
@@ -1069,6 +1072,7 @@
           preemption-decisions (rebalancer/rebalance db offer-cache
                                                      pending-job-ents 
                                                      available-resources 
+                                                     (atom {})
                                                      params)
           pending-job-ents-to-run (map :to-make-room-for preemption-decisions)
           task-ents-to-preempt (mapcat :task preemption-decisions)]
@@ -1100,7 +1104,7 @@
           pending-job-gen  (gen/tuple pending-user-gen mem-gen cpus-gen)]
       (let [conn (restore-fresh-database! datomic-uri)
             offer-cache (init-offer-cache)
-            _ (share/set-share! conn "default"
+            _ (share/set-share! conn "default" nil
                                 "limits for new cluster"
                                 :mem 1024.0 :cpus Double/MAX_VALUE)
             running-tasks-sample-size 10240
@@ -1121,6 +1125,7 @@
             pending-job-ents (util/get-pending-job-ents db)
             [pending-job-ents-to-run task-ents-to-preempt] (time (rebalancer/rebalance db offer-cache
                                                                                        pending-job-ents {}
+                                                                                       (atom {})
                                                                                        {:max-preemption 128
                                                                                         :safe-dru-threshold 1.0
                                                                                         :min-dru-diff 0.5
@@ -1153,5 +1158,161 @@
       (rebalancer/update-datomic-params-from-config! conn {:foo "bar" :ding 2})
       (is (= (rebalancer/read-datomic-params conn) merged-params))))))
 
+(deftest test-rebalance-host-reservation
+  (testing "reserves host for multiple preemptions"
+    (let [datomic-uri "datomic:mem://test-rebalance-host-reservation"
+          conn (restore-fresh-database! datomic-uri)
+          params {:max-preemption 128 :safe-dru-threshold 1.0 :min-dru-diff 0.0 :category :normal}
+          offer-cache (init-offer-cache)
+          job1 (create-dummy-job conn :user "user1" :memory 6.0 :ncpus 6.0)
+          job2 (create-dummy-job conn :user "user1" :memory 6.0 :ncpus 6.0)
+          job4 (create-dummy-job conn :user "user2" :memory 10.0 :ncpus 10.0)
+          task1 (create-dummy-instance conn
+                                       job1
+                                       :instance-status :instance.status/running
+                                       :hostname "hostA")
+          task2 (create-dummy-instance conn
+                                       job2
+                                       :instance-status :instance.status/running
+                                       :hostname "hostA")
+          reservations (atom {})]
+      (share/set-share! conn "user1" nil
+                        "test update"
+                        :mem 1.0 :cpus 1.0)
+      (share/set-share! conn "user2" nil
+                        "big user"
+                        :mem 10.0 :cpus 10.0)
+      (let [db (d/db conn)
+            [{:keys [hostname task to-make-room-for]}]
+            (rebalancer/rebalance db
+                                  offer-cache
+                                  (util/get-pending-job-ents db)
+                                  {"hostA" {:cpus 0.0 :mem 0.0 :gpus 0.0}}
+                                  reservations
+                                  params)]
+        (is (= "hostA" hostname))
+        (is (= job4 (:db/id to-make-room-for)))
+        (is (= [task1 task2] (map :db/id task)))
+        (is (= {(:job/uuid (d/entity db job4)) "hostA"}
+               (:job-uuid->reserved-host @reservations)))
+        (is (= #{} (:launched-job-uuids @reservations))))))
+
+  (testing "does not reserve host for single preempted task"
+    (let [datomic-uri "datomic:mem://test-rebalance-host-reservation-single"
+          conn (restore-fresh-database! datomic-uri)
+          params {:max-preemption 128 :safe-dru-threshold 1.0 :min-dru-diff 0.0 :category :normal}
+          offer-cache (init-offer-cache)
+          job1 (create-dummy-job conn :user "user1" :memory 6.0 :ncpus 6.0)
+          job2 (create-dummy-job conn :user "user2" :memory 1.0 :ncpus 1.0)
+          task1 (create-dummy-instance conn
+                                       job1
+                                       :instance-status :instance.status/running
+                                       :hostname "hostA")
+          reservations (atom {})]
+      (share/set-share! conn "user1" nil
+                        "test update"
+                        :mem 1.0 :cpus 1.0)
+      (share/set-share! conn "user2" nil
+                        "test update"
+                        :mem 1.0 :cpus 1.0)
+      (let [db (d/db conn)
+            [{:keys [hostname task to-make-room-for]}]
+            (rebalancer/rebalance db
+                                  offer-cache
+                                  (util/get-pending-job-ents db)
+                                  {"hostA" {:cpus 0.0 :mem 0.0 :gpus 0.0}}
+                                  reservations
+                                  params)]
+        (is (= "hostA" hostname))
+        (is (= job2 (:db/id to-make-room-for)))
+        (is (= [task1] (map :db/id task)))
+        (is (= {} (:job-uuid->reserved-host @reservations)))
+        (is (= #{} (:launched-job-uuids @reservations))))))
+
+  (testing "does not reserve host for job already launched"
+    (let [datomic-uri "datomic:mem://test-rebalance-host-reservation"
+          conn (restore-fresh-database! datomic-uri)
+          params {:max-preemption 128 :safe-dru-threshold 1.0 :min-dru-diff 0.0 :category :normal}
+          offer-cache (init-offer-cache)
+          job1 (create-dummy-job conn :user "user1" :memory 6.0 :ncpus 6.0)
+          job2 (create-dummy-job conn :user "user1" :memory 6.0 :ncpus 6.0)
+          job4 (create-dummy-job conn :user "user2" :memory 10.0 :ncpus 10.0)
+          task1 (create-dummy-instance conn
+                                       job1
+                                       :instance-status :instance.status/running
+                                       :hostname "hostA")
+          task2 (create-dummy-instance conn
+                                       job2
+                                       :instance-status :instance.status/running
+                                       :hostname "hostA")
+          reservations (atom {:launched-job-uuids [(:job/uuid (d/entity (d/db conn) job4))]})]
+      (share/set-share! conn "user1" nil
+                        "test update"
+                        :mem 1.0 :cpus 1.0)
+      (share/set-share! conn "user2" nil
+                        "big user"
+                        :mem 10.0 :cpus 10.0)
+      (let [db (d/db conn)
+            [{:keys [hostname task to-make-room-for]}]
+            (rebalancer/rebalance db
+                                  offer-cache
+                                  (util/get-pending-job-ents db)
+                                  {"hostA" {:cpus 0.0 :mem 0.0 :gpus 0.0}}
+                                  reservations
+                                  params)]
+        (is (= "hostA" hostname))
+        (is (= job4 (:db/id to-make-room-for)))
+        (is (= [task1 task2] (map :db/id task)))
+        (is (= {} (:job-uuid->reserved-host @reservations)))
+        (is (= #{} (:launched-job-uuids @reservations)))))))
+
+(deftest test-reserve-hosts
+  (testing "only reserves hosts with multiple preemptions"
+    (let [decisions [{:task ["a" "b"]
+                      :hostname "hostA"
+                      :to-make-room-for {:job/uuid "jobA"}}
+                     {:task ["c"]
+                      :hostname "hostB"
+                      :to-make-room-for {:job/uuid "jobB"}}]
+          rebalancer-reservation-atom (atom {})]
+      (rebalancer/reserve-hosts! rebalancer-reservation-atom decisions)
+      (is (= #{} (:launched-job-uuids @rebalancer-reservation-atom)))
+      (is (= {"jobA" "hostA"} (:job-uuid->reserved-host @rebalancer-reservation-atom)))))
+
+  (testing "does not reserve hosts for jobs that have already launched"
+    (let [decisions [{:task ["a" "b"]
+                      :hostname "hostA"
+                      :to-make-room-for {:job/uuid "jobA"}}]
+          rebalancer-reservation-atom (atom {:launched-job-uuids #{"jobA"}})]
+      (rebalancer/reserve-hosts! rebalancer-reservation-atom decisions)
+      (is (= #{} (:launched-job-uuids @rebalancer-reservation-atom)))
+      (is (= {} (:job-uuid->reserved-host @rebalancer-reservation-atom))))))
+
+(deftest test-reserve-hosts-integration
+  (testing "does not reserve another host after launching job"
+    (let [datomic-uri "datomic:mem://test-reserve-hosts-integration"
+          conn (restore-fresh-database! datomic-uri)
+          job-id (create-dummy-job conn :user "user1" :memory 6.0 :ncpus 6.0)
+          job (d/entity (d/db conn) job-id)
+          first-decision [{:task ["a" "b"]
+                           :hostname "hostA"
+                           :to-make-room-for job}]
+          second-decision [{:task ["a" "b"]
+                            :hostname "hostB"
+                            :to-make-room-for job}]
+          ^TaskRequest task-request (sched/make-task-request (d/db conn) job)
+          match [{:tasks [(SimpleAssignmentResult. [] nil task-request)]}]
+          rebalancer-reservation-atom (atom {})]
+      (rebalancer/reserve-hosts! rebalancer-reservation-atom first-decision)
+      (is (= {(:job/uuid job) "hostA"} (:job-uuid->reserved-host @rebalancer-reservation-atom)))
+      (is (= #{} (:launched-job-uuids @rebalancer-reservation-atom)))
+
+      (sched/update-host-reservations! rebalancer-reservation-atom match)
+      (is (= {} (:job-uuid->reserved-host @rebalancer-reservation-atom)))
+      (is (= #{(:job/uuid job)} (:launched-job-uuids @rebalancer-reservation-atom)))
+
+      (rebalancer/reserve-hosts! rebalancer-reservation-atom second-decision)
+      (is (= {}) (:job-uuid->reserved-host @rebalancer-reservation-atom))
+      (is (= #{}) (:launched-job-uuids @rebalancer-reservation-atom)))))
 
 (comment (run-tests))

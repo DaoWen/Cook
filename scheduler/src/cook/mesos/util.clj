@@ -16,15 +16,57 @@
 (ns cook.mesos.util
   (:require [clj-time.coerce :as tc]
             [clj-time.core :as t]
+            [clj-time.format :as tf]
             [clj-time.periodic :refer [periodic-seq]]
+            [cook.config :as config]
             [cook.mesos.schema :as schema]
             [clojure.core.async :as async]
             [clojure.core.cache :as cache]
+            [clojure.tools.logging :as log]
             [datomic.api :as d :refer (q)]
             [metatransaction.core :refer (db)]
             [metrics.timers :as timers]
             [plumbing.core :as pc :refer (map-vals map-keys)])
-  (:import [java.util Date]))
+  (:import
+    [com.google.common.cache Cache CacheBuilder]
+    [java.util.concurrent TimeUnit]
+    [java.util Date UUID]))
+
+
+(defn new-cache []
+  "Build a new cache"
+  (-> (CacheBuilder/newBuilder)
+      (.maximumSize 1000000)
+      ;; if its not been accessed in 2 hours, whatever is going on, its not being visted by the
+      ;; scheduler loop anymore. E.g., its probably failed/done and won't be needed. So,
+      ;; lets kick it out to keep cache small.
+      (.expireAfterAccess 2 TimeUnit/HOURS)
+      (.build)))
+
+(defn lookup-cache!
+  "Generic cache. Caches under a key (extracted from the item with extract-key-fn. Uses miss-fn to fill
+  any misses. Caches only positive hits where both functions return non-nil"
+  [^Cache cache extract-key-fn miss-fn item]
+  (if-let [key (extract-key-fn item)]
+    (if-let [result (.getIfPresent cache key)]
+      result ; we got a hit.
+      (let [new-result (miss-fn item)]
+        ; Only cache non-nil
+        (when new-result
+          (.put cache key new-result))
+        new-result))
+    (miss-fn item)))
+
+(defn lookup-cache-datomic-entity!
+  "Specialized function for caching where datomic entities are the key.
+  Extracts :db/id so that we don't keep the entity alive in the cache."
+  [cache miss-fn entity]
+  (lookup-cache! cache :db/id miss-fn entity))
+
+(defonce ^Cache job-ent->resources-cache (new-cache))
+(defonce ^Cache categorize-job-cache (new-cache))
+(defonce ^Cache task-ent->user-cache (new-cache))
+(defonce ^Cache task->feature-vector-cache (new-cache))
 
 (defn get-all-resource-types
   "Return a list of all supported resources types. Example, :cpus :mem :gpus ..."
@@ -39,10 +81,13 @@
   "Return the category of the job. Currently jobs can be :normal or :gpu. This
    is used to give separate queues for scarce & non-scarce resources"
   [job]
-  (let [resources (:job/resource job)]
-    (if (some #(= :resource.type/gpus (:resource/type %)) resources)
-      :gpu
-      :normal)))
+  (let [categorize-job-miss
+        (fn [job]
+          (let [resources (:job/resource job)]
+            (if (some #(= :resource.type/gpus (:resource/type %)) resources)
+              :gpu
+              :normal)))]
+    (lookup-cache-datomic-entity! categorize-job-cache categorize-job-miss job)))
 
 (defn without-ns
   [k]
@@ -91,7 +136,7 @@
 
 (defn entity->map
   "Takes a datomic entity and converts it along with any nested entities
-  into clojure maps"
+   into clojure maps"
   ([entity db]
    (entity->map (d/entity db (:db/id entity))))
   ([entity]
@@ -108,20 +153,24 @@
                       (remove (partial = :group/job)))]
   (defn job-ent->map
     "Convert a job entity to a map.
-     This also loads the associated group without the nested jobs in the group and converts it to a map."
+     This also loads the associated group without the nested jobs in the group and converts it to a map.
+     Returns nil if there was an error while converting the job entity to a map."
     ([job db]
      (job-ent->map (d/entity db (:db/id job))))
     ([job]
-     (let [group-ent (first (:group/_job job))
-           job (entity->map job)
-           group (when group-ent
-                   (->> group-keys
-                        (pc/map-from-keys (fn [k] (entity->map (get group-ent k))))
-                        ; The :group/job key normally returns a set, so let's do the same for compatibility
-                        hash-set))]
-       (cond-> job
-         group (assoc :group/_job group))))))
-
+     (try
+       (let [group-ent (first (:group/_job job))
+             job (entity->map job)
+             group (when group-ent
+                     (->> group-keys
+                          (pc/map-from-keys (fn [k] (entity->map (get group-ent k))))
+                          ; The :group/job key normally returns a set, so let's do the same for compatibility
+                          hash-set))]
+         (cond-> job
+                 group (assoc :group/_job group)))
+       (catch Exception e
+         ;; not logging the stacktrace as it adds noise and can cause the log files to blow up in size
+         (log/error "Error while converting job entity to a map" {:job job :message (.getMessage e)}))))))
 
 (defn remove-datomic-namespacing
   "Takes a map from datomic (pull) and removes the namespace
@@ -157,8 +206,8 @@
   [job-ent]
   (reduce (fn [m env-var]
             (assoc m
-                   (:environment/name env-var)
-                   (:environment/value env-var)))
+              (:environment/name env-var)
+              (:environment/value env-var)))
           {}
           (:job/environment job-ent)))
 
@@ -167,25 +216,28 @@
   [job-ent]
   (reduce (fn [m label-var]
             (assoc m
-                   (:label/key label-var)
-                   (:label/value label-var)))
+              (:label/key label-var)
+              (:label/value label-var)))
           {}
           (:job/label job-ent)))
 
 (defn job-ent->resources
   "Take a job entity and return a resource map. NOTE: the keys must be same as mesos resource keys"
-  [job-ent]
-  (reduce (fn [m r]
-            (let [resource (keyword (name (:resource/type r)))]
-              (condp contains? resource
-                #{:cpus :mem :gpus} (assoc m resource (:resource/amount r))
-                #{:uri} (update-in m [:uris] (fnil conj [])
-                                   {:cache (:resource.uri/cache? r false)
-                                    :executable (:resource.uri/executable? r false)
-                                    :value (:resource.uri/value r)
-                                    :extract (:resource.uri/extract? r false)}))))
-          {:ports (:job/ports job-ent 0)}
-          (:job/resource job-ent)))
+  [job]
+  (let [job-ent->resources-miss
+        (fn [job-ent]
+          (reduce (fn [m r]
+                    (let [resource (keyword (name (:resource/type r)))]
+                      (condp contains? resource
+                        #{:cpus :mem :gpus} (assoc m resource (:resource/amount r))
+                        #{:uri} (update-in m [:uris] (fnil conj [])
+                                           {:cache (:resource.uri/cache? r false)
+                                            :executable (:resource.uri/executable? r false)
+                                            :value (:resource.uri/value r)
+                                            :extract (:resource.uri/extract? r false)}))))
+                  {:ports (:job/ports job-ent 0)}
+                  (:job/resource job-ent)))]
+    (lookup-cache-datomic-entity! job-ent->resources-cache job-ent->resources-miss job)))
 
 (defn job-ent->attempts-consumed
   "Determines the amount of attempts consumed by a job-ent."
@@ -231,12 +283,12 @@
   ;; db to improve the performance of this query. We are working to remove
   ;; metatransaction throughout the code
   (->> (q '[:find [?j ...]
-            :in $ [?state ...] ?committed?
+            :in $ ?state ?committed?
             :where
             [?j :job/state ?state]
             [?j :job/commit-latch ?cl]
             [?cl :commit-latch/committed? ?committed?]]
-          unfiltered-db [:job.state/waiting] committed?)
+          unfiltered-db :job.state/waiting committed?)
        (map (partial d/entity unfiltered-db))))
 
 (timers/deftimer [cook-mesos scheduler get-pending-jobs-duration])
@@ -301,7 +353,7 @@
 (defn get-completed-jobs-by-user
   "Returns all completed job entities for a particular user
    in the specified timeframe, without a custom executor."
-  [db user start end limit state name-filter-fn]
+  [db user start end limit state name-filter-fn include-custom-executor?]
   (timers/time!
     get-completed-jobs-by-user-duration
     (let [;; Expand the time range so that clock skew between cook
@@ -321,13 +373,18 @@
                (map (partial d/entity db))
                (filter #(<= (.getTime start) (.getTime (:job/submit-time %))))
                (filter #(< (.getTime (:job/submit-time %)) (.getTime end)))
-               (filter #(= :job.state/completed (:job/state %)))
-               (filter #(not (:job/custom-executor %))))]
+               (filter #(= :job.state/completed (:job/state %))))]
       (->>
         (cond->> jobs
+                 (not include-custom-executor?) (filter #(false? (:job/custom-executor %)))
                  (instance-states state) (filter #(= state (job-ent->state %)))
                  name-filter-fn (filter #(name-filter-fn (:job/name %))))
         (take limit)))))
+
+(defn uncommitted?
+  "Returns true if the given job's commit latch is not committed"
+  [job]
+  (-> job :job/commit-latch :commit-latch/committed? not))
 
 ;; This is a separate query from completed jobs because most running/waiting jobs
 ;; will be at the end of the time range, so the query is somewhat inefficent.
@@ -338,7 +395,7 @@
    and timeframe, without a custom executor.
    Note that this query is not performant for completed jobs, use
    get-completed-jobs-by-user instead."
-  [db user start end state name-filter-fn]
+  [db user start end state name-filter-fn include-custom-executor?]
   (let [state-keyword (case state
                         "running" :job.state/running
                         "waiting" :job.state/waiting)
@@ -352,20 +409,24 @@
                     [?j :job/user ?user]
                     [?j :job/submit-time ?t]
                     [(<= ?start ?t)]
-                    [(< ?t ?end)]
-                    [?j :job/custom-executor false]]
+                    [(< ?t ?end)]]
                   db user state-keyword start end)
                (map (partial d/entity db))))]
-    (cond->> jobs name-filter-fn (filter #(name-filter-fn (:job/name %))))))
+    (cond->> jobs
+             (not include-custom-executor?) (filter #(false? (:job/custom-executor %)))
+             name-filter-fn (filter #(name-filter-fn (:job/name %)))
+             (and include-custom-executor? (= :job.state/waiting state-keyword)) (remove uncommitted?))))
 
 (defn get-jobs-by-user-and-states
   "Returns all jobs for a particular user in the specified states
    and timeframe, without a custom executor."
-  [db user states start end limit name-filter-fn]
+  [db user states start end limit name-filter-fn include-custom-executor?]
   (let [get-jobs-by-state (fn get-jobs-by-state [state]
                             (if (#{"completed" "success" "failed"} state)
-                              (get-completed-jobs-by-user db user start end limit state name-filter-fn)
-                              (get-active-jobs-by-user-and-state db user start end state name-filter-fn)))
+                              (get-completed-jobs-by-user db user start end limit state
+                                                          name-filter-fn include-custom-executor?)
+                              (get-active-jobs-by-user-and-state db user start end state
+                                                                 name-filter-fn include-custom-executor?)))
         jobs-by-state (mapcat get-jobs-by-state states)]
     (->> jobs-by-state
          (sort-by :job/submit-time)
@@ -402,12 +463,19 @@
 
 (timers/deftimer [cook-mesos scheduler get-user-running-jobs-duration])
 
+(defn default-pool?
+  "Returns true if the provided pool name matches
+  the currently configured default pool name"
+  [pool-name]
+  (= pool-name (config/default-pool)))
+
 (defn get-user-running-job-ents
   "Returns all running job entities for a specific user."
-  [db user]
-  (timers/time!
-    get-user-running-jobs-duration
-    (->> (q '[:find [?j ...]
+  ([db user]
+   (timers/time!
+     get-user-running-jobs-duration
+     (->> (q
+            '[:find [?j ...]
               :in $ ?user
               :where
               ;; Note: We're assuming that many users will have significantly more
@@ -416,6 +484,40 @@
               [?j :job/state :job.state/running]
               [?j :job/user ?user]]
             db user)
+          (map (partial d/entity db))))))
+
+(defn get-user-running-job-ents-in-pool
+  "Returns all running job entities for a specific user and pool."
+  [db user pool-name]
+  (let [requesting-default-pool? (or (nil? pool-name) (default-pool? pool-name))
+        pool-name' (or pool-name (config/default-pool) (UUID/randomUUID))]
+    (timers/time!
+      get-user-running-jobs-duration
+      (->> (q
+             '[:find [?j ...]
+               :in $ ?user ?pool-name ?requesting-default-pool
+               :where
+               ;; Note: We're assuming that many users will have significantly more
+               ;; completed jobs than there are jobs currently running in the system.
+               ;; If not, we might want to swap these two constraints.
+               [?j :job/state :job.state/running]
+               [?j :job/user ?user]
+               [(cook.mesos.pool/check-pool $ ?j :job/pool ?pool-name ?requesting-default-pool)]]
+             db user pool-name' requesting-default-pool?)
+           (map (partial d/entity db))))))
+
+(timers/deftimer [cook-mesos scheduler get-running-jobs-duration])
+
+(defn get-running-job-ents
+  "Returns all running job entities."
+  [db]
+  (timers/time!
+    get-running-jobs-duration
+    (->> (q '[:find [?j ...]
+              :in $
+              :where
+              [?j :job/state :job.state/running]]
+            db)
          (map (partial d/entity db)))))
 
 (defn job-allowed-to-start?
@@ -438,64 +540,51 @@
 
 (defn task-ent->user
   [task-ent]
-  (get-in task-ent [:job/_instance :job/user]))
+  (let [task-ent->user-miss
+        (fn [task-ent]
+          (get-in task-ent [:job/_instance :job/user]))]
+    (lookup-cache-datomic-entity! task-ent->user-cache task-ent->user-miss task-ent)))
 
 (def ^:const default-job-priority 50)
 
 
 (defn task->feature-vector
-  [task]
   "Vector of comparable features of a task.
    Last two elements are aribitary tie breakers.
    Use :db/id because they guarantee uniqueness for different entities
    (:db/id task) is not sufficient because synthetic task entities don't have :db/id
-    This assumes there are at most one synthetic task for a job, otherwise uniqueness invariant will break"
-  [(- (:job/priority (:job/_instance task) default-job-priority))
-   (:instance/start-time task (java.util.Date. Long/MAX_VALUE))
-   (:db/id task)
-   (:db/id (:job/_instance task))])
+   This assumes there are at most one synthetic task for a job, otherwise uniqueness invariant will break"
+  [task]
+  (let [task->feature-vector-miss
+        (fn [task]
+          [(- (:job/priority (:job/_instance task) default-job-priority))
+           (:instance/start-time task (java.util.Date. Long/MAX_VALUE))
+           (:db/id task)
+           (:db/id (:job/_instance task))])
+        extract-key
+        (fn [item]
+          (or (:db/id item) (:db/id (:job/_instance item))))]
+    (lookup-cache! task->feature-vector-cache extract-key task->feature-vector-miss task)))
 
 (defn same-user-task-comparator
   "Comparator to order same user's tasks"
   ([]
    (same-user-task-comparator []))
   ([tasks]
-    ;; Pre-compute the feature-vector for tasks we expect to see to improve performance
-    ;; This is done because accessing fields in datomic entities is much slower than
-    ;; a map access, even when accessing multiple times.
-    ;; Don't want to complicate the function by caching new values in the event we see them
-   (let [task-ent->feature-vector (pc/map-from-keys task->feature-vector tasks)]
-     (fn [task1 task2]
-       (compare (or (task-ent->feature-vector task1)
-                    (task->feature-vector task1))
-                (or (task-ent->feature-vector task2)
-                    (task->feature-vector task2)))))))
+   (fn [task1 task2]
+     (compare (task->feature-vector task1)
+              (task->feature-vector task2)))))
 
 (defn retry-job!
   "Sets :job/max-retries to the given value for the given job UUID.
    Also resets the job state to 'waiting' if it had completed.
    Throws an exception if there is no job with that UUID."
   [conn uuid retries]
-  (try
-    (let [eid (-> (d/entity (d/db conn) [:job/uuid uuid])
-                  :db/id)]
-      @(d/transact conn
-                   [[:db/add [:job/uuid uuid]
-                     :job/max-retries retries]
-
-                    ;; If the job is in the "completed" state, put it back into
-                    ;; "waiting":
-                    [:db.fn/cas [:job/uuid uuid]
-                     :job/state (d/entid (d/db conn) :job.state/completed) :job.state/waiting]]))
-    ;; :db.fn/cas throws an exception if the job is not already in the "completed" state.
-    ;; If that happens, that's fine. We just set "retries" only and continue.
-    (catch java.util.concurrent.ExecutionException e
-      (if-not (.startsWith (.getMessage e)
-                           "java.lang.IllegalStateException: :db.error/cas-failed Compare failed:")
-        (throw (ex-info "Exception while retrying job" {:uuid uuid :retries retries} e))
-        @(d/transact conn
-                     [[:db/add [:job/uuid uuid]
-                       :job/max-retries retries]])))))
+  (let [eid (-> (d/entity (d/db conn) [:job/uuid uuid])
+                :db/id)]
+    @(d/transact conn
+                 [[:job/update-retry-count [:job/uuid uuid] retries]
+                  [:job/update-state-on-retry [:job/uuid uuid] retries]])))
 
 (defn filter-sequential
   "This function allows for filtering when the filter function needs to consider previous elements
@@ -681,3 +770,16 @@
   (swap! cache-store #(-> %
                           (cache/evict key)
                           (cache/miss key value))))
+
+(defn parse-time
+  "Parses the provided string as a DateTime"
+  [s]
+  (or (tf/parse s)
+      (tc/from-long (Long/parseLong s))))
+
+(defn parse-int-default
+  "Parses the provided string as an integer"
+  [s d]
+  (if (nil? s)
+    d
+    (Integer/parseInt s)))

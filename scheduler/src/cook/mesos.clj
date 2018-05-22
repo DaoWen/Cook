@@ -21,12 +21,13 @@
             [clojure.core.async :as async]
             [clojure.data.json :as json]
             [clojure.tools.logging :as log]
-            [cook.curator :as curator]
             [cook.datomic :refer (transact-with-retries)]
             [cook.mesos.heartbeat]
             [cook.mesos.monitor]
+            [cook.mesos.optimizer]
             [cook.mesos.rebalancer]
             [cook.mesos.scheduler :as sched]
+            [cook.mesos.util]
             [cook.util]
             [datomic.api :as d :refer (q)]
             [mesomatic.scheduler]
@@ -105,20 +106,14 @@
     scheduler framework-id]
    (apply mesomatic.scheduler/scheduler-driver
           scheduler
-          (merge
-            {:user ""
-             :name (str mesos-framework-name "-" @cook.util/version "-" @cook.util/commit)
-             :checkpoint true}
-            (when mesos-role
-              {:role mesos-role})
-            (when mesos-principal
-              {:principal mesos-principal})
-            (when gpu-enabled?
-              {:capabilities [{:type :framework-capability-gpu-resources}]})
-            (when mesos-failover-timeout
-              {:failover-timeout mesos-failover-timeout})
-            (when framework-id
-              {:id {:value framework-id}}))
+          (cond-> {:checkpoint true
+                   :name (str mesos-framework-name "-" @cook.util/version "-" @cook.util/commit)
+                   :user ""}
+                  framework-id (assoc :id {:value framework-id})
+                  gpu-enabled? (assoc :capabilities [{:type :framework-capability-gpu-resources}])
+                  mesos-failover-timeout (assoc :failover-timeout mesos-failover-timeout)
+                  mesos-principal (assoc :principal mesos-principal)
+                  mesos-role (assoc :role mesos-role))
           mesos-master
           (when mesos-principal
             [{:principal mesos-principal}]))))
@@ -145,7 +140,7 @@
   "Creates a map of of the trigger channels expected by `start-mesos-scheduler`
    Each channel receives chime triggers at particular intervals and it is
    possible to send additional events as desired"
-  [rebalancer-config progress-config
+  [rebalancer-config progress-config optimizer-config
    {:keys [timeout-interval-minutes]
     :or {timeout-interval-minutes 1}
     :as task-constraints}]
@@ -157,6 +152,7 @@
     {:cancelled-task-trigger-chan (prepare-trigger-chan (time/seconds 3))
      :lingering-task-trigger-chan (prepare-trigger-chan (time/minutes timeout-interval-minutes))
      :match-trigger-chan (prepare-trigger-chan (time/seconds 1))
+     :optimizer-trigger-chan (prepare-trigger-chan (time/seconds (:optimizer-interval-seconds optimizer-config 10)))
      :progress-updater-trigger-chan (prepare-trigger-chan (time/millis (:publish-interval-ms progress-config)))
      :rank-trigger-chan (prepare-trigger-chan (time/seconds 5))
      :rebalancer-trigger-chan (prepare-trigger-chan (time/seconds (:interval-seconds rebalancer-config)))
@@ -167,41 +163,39 @@
    scheduler and associated threads to interact with mesos.
 
    Parameters
-   make-mesos-driver-fn     -- fn, function that accepts a mesos scheduler and framework id
-                                   and returns a mesos driver
-   get-mesos-utilization    -- fn, function with no parameters, returns utilization of cluster [0,1]
-   mesos-master-hosts       -- seq[strings], url of mesos masters to query for cluster info
-   curator-framework        -- curator object, object for interacting with zk
-   mesos-datomic-conn       -- datomic conn, connection to datomic db for interacting with datomic
-   mesos-datomic-mult       -- async channel, feed of db writes
-   zk-prefix                -- str, prefix in zk for cook data
-   offer-incubate-time-ms   -- long, time in millis that offers are allowed to sit before they are declined
-   mea-culpa-failure-limit  -- long, max failures of mea culpa reason before it is considered a 'real' failure
-                                     see scheduler/docs/configuration.adoc for more details
-   task-constraints         -- map, constraints on task. See scheduler/docs/configuration.adoc for more details
-   executor                 -- cook executor config includes command, default-progress-regex-string, environment,
-                                     log-level, message-length, progress-sample-interval-ms and uri.
-   riemann-host             -- str, dns name of riemann
-   riemann-port             -- int, port for riemann
-   mesos-pending-jobs-atom  -- atom, Populate (and update) list of pending jobs into atom
-   offer-cache              -- atom, map from host to most recent offer. Used to get attributes
-   gpu-enabled?             -- boolean, whether cook will schedule gpus
-   rebalancer-config        -- map, config for rebalancer. See scheduler/docs/rebalancer-config.adoc for details
-   progress-config          -- map, config for progress publishing. See scheduler/docs/configuration.adoc for more details
-   framework-id             -- str, the Mesos framework id from the cook settings
-   fenzo-config             -- map, config for fenzo, See scheduler/docs/configuration.adoc for more details"
-  [{:keys [curator-framework executor-config fenzo-config framework-id get-mesos-utilization gpu-enabled? make-mesos-driver-fn
+   make-mesos-driver-fn          -- fn, function that accepts a mesos scheduler and framework id
+                                    and returns a mesos driver
+   get-mesos-utilization         -- fn, function with no parameters, returns utilization of cluster [0,1]
+   mesos-master-hosts            -- seq[strings], url of mesos masters to query for cluster info
+   curator-framework             -- curator object, object for interacting with zk
+   mesos-datomic-conn            -- datomic conn, connection to datomic db for interacting with datomic
+   mesos-datomic-mult            -- async channel, feed of db writes
+   zk-prefix                     -- str, prefix in zk for cook data
+   offer-incubate-time-ms        -- long, time in millis that offers are allowed to sit before they are declined
+   mea-culpa-failure-limit       -- long, max failures of mea culpa reason before it is considered a 'real' failure
+                                    see scheduler/docs/configuration.adoc for more details
+   task-constraints              -- map, constraints on task. See scheduler/docs/configuration.adoc for more details
+   mesos-pending-jobs-atom       -- atom, Populate (and update) list of pending jobs into atom
+   offer-cache                   -- atom, map from host to most recent offer. Used to get attributes
+   gpu-enabled?                  -- boolean, whether cook will schedule gpus
+   rebalancer-config             -- map, config for rebalancer. See scheduler/docs/rebalancer-config.adoc for details
+   progress-config               -- map, config for progress publishing. See scheduler/docs/configuration.adoc
+   framework-id                  -- str, the Mesos framework id from the cook settings
+   fenzo-config                  -- map, config for fenzo, See scheduler/docs/configuration.adoc for more details
+   sandbox-syncer-state          -- map, representing the sandbox syncer object"
+  [{:keys [curator-framework fenzo-config framework-id get-mesos-utilization gpu-enabled? make-mesos-driver-fn
            mea-culpa-failure-limit mesos-datomic-conn mesos-datomic-mult mesos-leadership-atom mesos-pending-jobs-atom
-           offer-cache offer-incubate-time-ms progress-config rebalancer-config riemann-host riemann-port
-           sandbox-publisher-state server-config task-constraints trigger-chans zk-prefix]}]
+           mesos-run-as-user offer-cache offer-incubate-time-ms optimizer-config progress-config rebalancer-config
+           sandbox-syncer-state server-config task-constraints trigger-chans zk-prefix]}]
   (let [{:keys [fenzo-fitness-calculator fenzo-floor-iterations-before-reset fenzo-floor-iterations-before-warn
                 fenzo-max-jobs-considered fenzo-scaleback good-enough-fitness]} fenzo-config
-        {:keys [cancelled-task-trigger-chan lingering-task-trigger-chan rebalancer-trigger-chan
-                straggler-trigger-chan]} trigger-chans
-        {:keys [hostname server-port]} server-config
+        {:keys [cancelled-task-trigger-chan lingering-task-trigger-chan optimizer-trigger-chan
+                rebalancer-trigger-chan straggler-trigger-chan]} trigger-chans
+        {:keys [hostname server-port server-https-port]} server-config
         datomic-report-chan (async/chan (async/sliding-buffer 4096))
         mesos-heartbeat-chan (async/chan (async/buffer 4096))
         current-driver (atom nil)
+        rebalancer-reservation-atom (atom {})
         leader-selector (LeaderSelector.
                           curator-framework
                           zk-prefix
@@ -216,33 +210,32 @@
                                 (try
                                   (let [{:keys [scheduler view-incubating-offers]}
                                         (sched/create-datomic-scheduler
-                                          mesos-datomic-conn
-                                          current-driver
-                                          mesos-pending-jobs-atom
-                                          offer-cache
-                                          mesos-heartbeat-chan
-                                          offer-incubate-time-ms
-                                          mea-culpa-failure-limit
-                                          fenzo-max-jobs-considered
-                                          fenzo-scaleback
-                                          fenzo-floor-iterations-before-warn
-                                          fenzo-floor-iterations-before-reset
-                                          fenzo-fitness-calculator
-                                          task-constraints
-                                          gpu-enabled?
-                                          good-enough-fitness
-                                          framework-id
-                                          sandbox-publisher-state
-                                          executor-config
-                                          progress-config
-                                          trigger-chans)
+                                         {:conn mesos-datomic-conn
+                                          :driver-atom current-driver
+                                          :fenzo-fitness-calculator fenzo-fitness-calculator
+                                          :fenzo-floor-iterations-before-reset fenzo-floor-iterations-before-reset
+                                          :fenzo-floor-iterations-before-warn fenzo-floor-iterations-before-warn
+                                          :fenzo-max-jobs-considered fenzo-max-jobs-considered
+                                          :fenzo-scaleback fenzo-scaleback
+                                          :framework-id framework-id
+                                          :good-enough-fitness good-enough-fitness
+                                          :gpu-enabled? gpu-enabled?
+                                          :heartbeat-ch mesos-heartbeat-chan
+                                          :mea-culpa-failure-limit mea-culpa-failure-limit
+                                          :mesos-run-as-user mesos-run-as-user
+                                          :offer-cache offer-cache
+                                          :offer-incubate-time-ms offer-incubate-time-ms
+                                          :pending-jobs-atom mesos-pending-jobs-atom
+                                          :progress-config progress-config
+                                          :rebalancer-reservation-atom rebalancer-reservation-atom
+                                          :sandbox-syncer-state sandbox-syncer-state
+                                          :task-constraints task-constraints
+                                          :trigger-chans trigger-chans})
                                         driver (make-mesos-driver-fn scheduler framework-id)]
                                     (mesomatic.scheduler/start! driver)
                                     (reset! current-driver driver)
 
-                                    (when riemann-host
-                                      (cook.mesos.monitor/riemann-reporter mesos-datomic-conn :riemann-host riemann-host :riemann-port riemann-port))
-                                    #_(cook.mesos.scheduler/reconciler mesos-datomic-conn driver)
+                                    (cook.mesos.monitor/start-collecting-stats)
                                     (cook.mesos.scheduler/lingering-task-killer mesos-datomic-conn driver task-constraints lingering-task-trigger-chan)
                                     (cook.mesos.scheduler/straggler-handler mesos-datomic-conn driver straggler-trigger-chan)
                                     (cook.mesos.scheduler/cancelled-task-killer mesos-datomic-conn driver cancelled-task-trigger-chan)
@@ -253,8 +246,20 @@
                                                                               :get-mesos-utilization get-mesos-utilization
                                                                               :offer-cache offer-cache
                                                                               :pending-jobs-atom mesos-pending-jobs-atom
+                                                                              :rebalancer-reservation-atom rebalancer-reservation-atom
                                                                               :trigger-chan rebalancer-trigger-chan
                                                                               :view-incubating-offers view-incubating-offers})
+                                    (when (seq optimizer-config)
+                                      (cook.mesos.optimizer/start-optimizer-cycles! (fn get-queue []
+                                                                                      ;; TODO Use filter of queue that scheduler uses to filter to considerable.
+                                                                                      ;;      Specifically, think about filtering to jobs that are waiting and 
+                                                                                      ;;      think about how to handle quota 
+                                                                                      @mesos-pending-jobs-atom)
+                                                                                    (fn get-running []
+                                                                                      (cook.mesos.util/get-running-task-ents (d/db mesos-datomic-conn)))
+                                                                                    view-incubating-offers
+                                                                                    optimizer-config
+                                                                                    optimizer-trigger-chan))
                                     (counters/inc! mesos-leader)
                                     (async/tap mesos-datomic-mult datomic-report-chan)
                                     (cook.mesos.scheduler/monitor-tx-report-queue datomic-report-chan mesos-datomic-conn current-driver)
@@ -283,7 +288,8 @@
                                   (log/fatal "Lost leadership in zookeeper. Exitting. Expecting a supervisor to restart me!")
                                   (System/exit 0))))))]
     (.setId leader-selector (str hostname \#
-                                 server-port \#
+                                 (or server-port server-https-port) \#
+                                 (if server-port "http" "https") \#
                                  (java.util.UUID/randomUUID)))
     (.autoRequeue leader-selector)
     (.start leader-selector)

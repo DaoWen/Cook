@@ -1,4 +1,4 @@
-<img src="./cook.svg" align="right" width="175px" height="150px">
+<img src="./cook.svg" align="right" width="150px" height="150px">
 
 # Cook Scheduler
 

@@ -129,6 +129,7 @@
             (case type
               "directory" (sandbox/update-sandbox sandbox-syncer-state parsed-message)
               "heartbeat" (heartbeat/notify-heartbeat heartbeat-ch executor-id slave-id parsed-message)
+              ;; XXX - I need an alernate way to hook into this
               (sched/async-in-order-processing
                 task-id #(sched/handle-framework-message conn message-handlers parsed-message))))
           (catch Exception e
@@ -242,8 +243,10 @@
           conn cook.datomic/conn
           {:keys [match-trigger-chan progress-updater-trigger-chan]} trigger-chans
           {:keys [batch-size]} progress-config
+          ;;; XXX - I think this is where it's being built, so I'll need to thread this in from components.clj instead
           {:keys [progress-state-chan]} (progress/progress-update-transactor progress-updater-trigger-chan batch-size conn)
           progress-aggregator-chan (progress/progress-update-aggregator progress-config progress-state-chan)
+          ;; XXX - I need an alternate way to hook into this
           handle-progress-message (fn handle-progress-message-curried [progress-message-map]
                                     (progress/handle-progress-message! progress-aggregator-chan progress-message-map))
           handle-exit-code (fn handle-exit-code [task-id exit-code]

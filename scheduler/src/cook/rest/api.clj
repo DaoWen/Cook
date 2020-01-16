@@ -2988,6 +2988,17 @@
                                404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
                    :handler (read-instances-handler-single conn is-authorized-fn)}}))
 
+        ;; XXX - this is my new endpoint! :D
+        (c-api/context
+          "/instances/:uuid/progress" [uuid]
+          :path-params [uuid :- s/Uuid]
+          (c-api/resource
+            {:post {:summary "Returns info about a single Job Instance"
+                    :responses {202 {:description "The status update."}
+                                400 {:description "A non-UUID value was passed."}
+                                403 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
+                    :handler (update-instance-progress-handler conn is-authorized-fn)}}))
+
         (c-api/context
           "/instances" []
           (c-api/resource
@@ -3091,6 +3102,7 @@
                                400 {:description "Non-UUID values were passed."}
                                404 {:description "The supplied UUIDs don't correspond to valid groups."}}
                    :handler (groups-action-handler conn task-constraints is-authorized-fn)}
+             ;; XXX - my new endpoint would be similar to this? permission checks, update state, etc.
              :delete
              {:summary "Kill all jobs within a set of groups"
               :parameters {:query-params KillGroupsParams}

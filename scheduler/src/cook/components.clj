@@ -210,9 +210,11 @@
 (defn conditional-auth-bypass
   "Skip authentication on some hard-coded endpoints."
   [h auth-middleware]
-  (let [auth-fn (auth-middleware h)]
+  (let [auth-fn (auth-middleware h)
+        no-auth-pattern #"/(?:info|instances/[-\w]+/progress)"]
     (fn filtered-auth [{:keys [uri request-method] :as req}]
-      (if (and (= "/info" uri) (= :get request-method))
+      ;; XXX - change this to a regex for both /info and my new /instances/:uuid/progress endpoint?
+      (if (re-matches no-auth-pattern uri)
         (h req)
         (auth-fn req)))))
 

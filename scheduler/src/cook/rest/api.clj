@@ -515,6 +515,13 @@
   (assoc JobSubmission
     (s/optional-key :pool) s/Str))
 
+(def JobInstanceProgressRequest
+  "Schema for a POST request to the /instances/:uuid/progress endpoint."
+  {:instance-id s/Uuid
+   (s/optional-key :progress-message) s/Str
+   (s/optional-key :progress-percent) s/Int
+   :progress-sequence s/Int})
+
 (defn- mk-container-params
   "Helper for build-container.  Transforms parameters into the datomic schema."
   [cid params]
@@ -2993,10 +3000,11 @@
           "/instances/:uuid/progress" [uuid]
           :path-params [uuid :- s/Uuid]
           (c-api/resource
-            {:post {:summary "Returns info about a single Job Instance"
-                    :responses {202 {:description "The status update."}
-                                400 {:description "A non-UUID value was passed."}
-                                403 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
+            {:post {:summary "Update the progress of a Job Instance"
+                    :parameters {:body-params JobInstanceProgressRequest}
+                    :responses {202 {:description "The progress update was accepted."}
+                                400 {:description "Invalid request format."}
+                                404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
                     :handler (update-instance-progress-handler conn is-authorized-fn)}}))
 
         (c-api/context

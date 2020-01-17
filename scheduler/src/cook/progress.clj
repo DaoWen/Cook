@@ -96,6 +96,7 @@
 (defn handle-progress-message!
   "Processes a progress message by sending it along the progress-aggregator-chan channel."
   [progress-aggregator-chan progress-message-map]
+  ;; XXX - move the task-id->datomic-entity-id translation here
   (async/put! progress-aggregator-chan progress-message-map))
 
 (histograms/defhistogram [cook-mesos scheduler progress-updater-pending-states])

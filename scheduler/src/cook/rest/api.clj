@@ -1645,10 +1645,14 @@
     (base-read-instances-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
 (defn update-instance-progress-handler
-  [conn is-authorized-fn]
+  [conn is-authorized-fn leadership-atom leader-selector]
   (base-cook-handler
     {:allowed-methods [:post]
      :exists? instance-request-exists?
+     :moved-temporarily? (fn [_]
+                           (if @leadership-atom
+                             [false {}]
+                             [true {:location (str (leader-url leader-selector) "/queue")}]))
      :post-enacted? (constantly false)  ;; triggers http 202 "accepted" response
      :post! (fn [ctx]
               (comment "XXX - Thread request body into update aggregator channel")
@@ -3176,9 +3180,10 @@
               {:post {:summary "Update the progress of a Job Instance"
                       :parameters {:body-params JobInstanceProgressRequest}
                       :responses {202 {:description "The progress update was accepted."}
+                                  307 {:description "Redirecting request to leader node."}
                                   400 {:description "Invalid request format."}
                                   404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
-                      :handler (update-instance-progress-handler conn is-authorized-fn)}}))))
+                      :handler (update-instance-progress-handler conn is-authorized-fn leadership-atom leader-selector)}}))))
 
       ; Data locality debug endpoints
       (c-api/context
@@ -3197,6 +3202,7 @@
            :responses {200 {:schema DataLocalUpdateTimeResponse}}
            :get {:summary "Returns summary information on the current data locality status"
                  :handler (data-local-update-time-handler conn)}}))
+
 
       (ANY "/queue" []
         (waiting-jobs conn mesos-pending-jobs-fn is-authorized-fn leadership-atom leader-selector))

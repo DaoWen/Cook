@@ -516,11 +516,12 @@
     (s/optional-key :pool) s/Str))
 
 (def JobInstanceProgressRequest
-  "Schema for a POST request to the /instances/:uuid/progress endpoint."
-  {:instance-id s/Uuid
-   (s/optional-key :progress-message) s/Str
-   (s/optional-key :progress-percent) s/Int
-   :progress-sequence s/Int})
+  "Schema for a POST request to the /progress/:uuid endpoint."
+  (s/both
+    (s/pred #(<= 2 (count %)) 'message-or-percent-required)
+    {:progress-sequence s/Int
+     (s/optional-key :progress-message) s/Str
+     (s/optional-key :progress-percent) s/Int}))
 
 (defn- mk-container-params
   "Helper for build-container.  Transforms parameters into the datomic schema."

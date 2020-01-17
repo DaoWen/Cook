@@ -211,7 +211,7 @@
   "Skip authentication on some hard-coded endpoints."
   [h auth-middleware]
   (let [auth-fn (auth-middleware h)
-        no-auth-pattern #"/(?:info|instances/[-\w]+/progress)"]
+        no-auth-pattern #"/(?:info|progress/[-\w]+)"]
     (fn filtered-auth [{:keys [uri request-method] :as req}]
       ;; XXX - change this to a regex for both /info and my new /instances/:uuid/progress endpoint?
       (if (re-matches no-auth-pattern uri)

@@ -3006,18 +3006,6 @@
                                404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
                    :handler (read-instances-handler-single conn is-authorized-fn)}}))
 
-        ;; XXX - this is my new endpoint! :D
-        (c-api/context
-          "/instances/:uuid/progress" [uuid]
-          :path-params [uuid :- s/Uuid]
-          (c-api/resource
-            {:post {:summary "Update the progress of a Job Instance"
-                    :parameters {:body-params JobInstanceProgressRequest}
-                    :responses {202 {:description "The progress update was accepted."}
-                                400 {:description "Invalid request format."}
-                                404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
-                    :handler (update-instance-progress-handler conn is-authorized-fn)}}))
-
         (c-api/context
           "/instances" []
           (c-api/resource
@@ -3176,7 +3164,21 @@
              :responses {200 {:schema PoolsResponse
                               :description "The pools were returned."}}
              :get {:summary "Returns the pools."
-                   :handler (pools-handler)}})))
+                   :handler (pools-handler)}}))
+
+        (c-api/undocumented
+          ;; XXX - this is my new endpoint! :D
+          ;; NOTE: The authentication for this endpoint is disabled via cook.components/conditional-auth-bypass
+          (c-api/context
+            "/progress/:uuid" [uuid]
+            :path-params [uuid :- s/Uuid]
+            (c-api/resource
+              {:post {:summary "Update the progress of a Job Instance"
+                      :parameters {:body-params JobInstanceProgressRequest}
+                      :responses {202 {:description "The progress update was accepted."}
+                                  400 {:description "Invalid request format."}
+                                  404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
+                      :handler (update-instance-progress-handler conn is-authorized-fn)}}))))
 
       ; Data locality debug endpoints
       (c-api/context

@@ -1643,6 +1643,16 @@
                        (comp first))]
     (base-read-instances-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
+(defn update-instance-progress-handler
+  [conn is-authorized-fn]
+  (base-cook-handler
+    {:allowed-methods [:post]
+     :exists? instance-request-exists?
+     :post-enacted? (constantly false)  ;; triggers http 202 "accepted" response
+     :post! (fn [ctx]
+              (comment "XXX - Thread request body into update aggregator channel")
+              (get-in ctx [:request :body-params]))}))
+
 ;;; On DELETE; use repeated job argument
 (defn destroy-jobs-handler
   [conn is-authorized-fn]

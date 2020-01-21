@@ -3130,7 +3130,6 @@
                                400 {:description "Non-UUID values were passed."}
                                404 {:description "The supplied UUIDs don't correspond to valid groups."}}
                    :handler (groups-action-handler conn task-constraints is-authorized-fn)}
-             ;; XXX - my new endpoint would be similar to this? permission checks, update state, etc.
              :delete
              {:summary "Kill all jobs within a set of groups"
               :parameters {:query-params KillGroupsParams}
@@ -3188,19 +3187,19 @@
                    :handler (pools-handler)}}))
 
         (c-api/undocumented
-          ;; XXX - this is my new endpoint! :D
-          ;; NOTE: The authentication for this endpoint is disabled via cook.components/conditional-auth-bypass
+          ;; internal api endpoints (don't include in swagger)
           (c-api/context
             "/progress/:uuid" [uuid]
             :path-params [uuid :- s/Uuid]
             (c-api/resource
+              ;; NOTE: The authentication for this endpoint is disabled via cook.components/conditional-auth-bypass
               {:post {:summary "Update the progress of a Job Instance"
                       :parameters {:body-params JobInstanceProgressRequest}
                       :responses {202 {:description "The progress update was accepted."}
                                   307 {:description "Redirecting request to leader node."}
                                   400 {:description "Invalid request format."}
                                   404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
-                      :handler (let [;; XXX - open issue for custom auth on this endpoint
+                      :handler (let [;; TODO: add lightweight auth -- https://github.com/twosigma/Cook/issues/1367
                                      mock-auth-fn (constantly true)]
                                  (update-instance-progress-handler conn mock-auth-fn leadership-atom leader-selector))}}))))
 

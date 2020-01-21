@@ -39,6 +39,7 @@
             [cook.plugins.pool]
             [cook.rest.impersonation :refer (impersonation-authorized-wrapper)]
             [cook.pool :as pool]
+            [cook.progress :as progress]
             ; This explicit require is needed so that mount can see the defstate defined in the cook.rate-limit namespace.
             ; cook.rate-limit and everything else under cook.rest.api is normally hidden from mount's defstate because
             ; cook.rest.api is loaded via util/lazy-load-var, not via 'ns :require'
@@ -284,6 +285,7 @@
                              mesos-agent-query-cache
                              mesos-heartbeat-chan
                              settings
+                             progress-aggregator-chan
                              trigger-chans]
                          (doall (map (fn [{:keys [factory-fn config]}]
                                        (let [resolved (util/lazy-load-var factory-fn)]
@@ -292,8 +294,17 @@
                                                            :mesos-agent-query-cache mesos-agent-query-cache
                                                            :mesos-heartbeat-chan mesos-heartbeat-chan
                                                            :sandbox-syncer-config (:sandbox-syncer settings)
+                                                           :progress-aggregator-chan progress-aggregator-chan
                                                            :trigger-chans trigger-chans})))
                                      (:compute-clusters settings))))
+     :progress-aggregator-chan (fnk [trigger-chans
+                                     [:settings [:progress batch-size :as progress-config]]]
+                                 (let [{:keys [progress-updater-trigger-chan]} trigger-chans
+                                       {:keys [progress-state-chan]} (progress/progress-update-transactor
+                                                                       progress-updater-trigger-chan
+                                                                       batch-size
+                                                                       datomic/conn)]
+                                   (progress/progress-update-aggregator progress-config progress-state-chan)))
      :mesos-datomic-mult (fnk []
                            (first ((util/lazy-load-var 'cook.datomic/create-tx-report-mult) datomic/conn)))
      ; TODO(pschorf): Remove hearbeat support

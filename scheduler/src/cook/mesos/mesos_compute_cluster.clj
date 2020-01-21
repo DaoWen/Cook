@@ -216,7 +216,7 @@
 
 (defrecord MesosComputeCluster [compute-cluster-name framework-id db-id driver-atom
                                 sandbox-syncer-state exit-code-syncer-state mesos-heartbeat-chan
-                                trigger-chans mesos-config pool->offers-chan container-defaults]
+                                progress-aggregator-chan trigger-chans mesos-config pool->offers-chan container-defaults]
   cc/ComputeCluster
   (compute-cluster-name [this]
     compute-cluster-name)
@@ -238,15 +238,8 @@
 
   (initialize-cluster [this pool->fenzo _]
     (log/info "Initializing Mesos compute cluster" compute-cluster-name)
-    (let [settings (:settings config/config)
-          progress-config (:progress settings)
-          conn cook.datomic/conn
-          {:keys [match-trigger-chan progress-updater-trigger-chan]} trigger-chans
-          {:keys [batch-size]} progress-config
-          ;;; XXX - I think this is where it's being built, so I'll need to thread this in from components.clj instead
-          {:keys [progress-state-chan]} (progress/progress-update-transactor progress-updater-trigger-chan batch-size conn)
-          progress-aggregator-chan (progress/progress-update-aggregator progress-config progress-state-chan)
-          ;; XXX - I need an alternate way to hook into this
+    (let [conn cook.datomic/conn
+          {:keys [match-trigger-chan]} trigger-chans
           handle-progress-message (fn handle-progress-message-curried [progress-message-map]
                                     (progress/handle-progress-message! progress-aggregator-chan progress-message-map))
           handle-exit-code (fn handle-exit-code [task-id exit-code]
@@ -351,6 +344,7 @@
            mesos-agent-query-cache
            mesos-heartbeat-chan
            sandbox-syncer-config
+           progress-aggregator-chan
            trigger-chans]}]
   (try
     (let [conn cook.datomic/conn
@@ -382,6 +376,7 @@
                                                        sandbox-syncer-state
                                                        exit-code-syncer-state
                                                        mesos-heartbeat-chan
+                                                       progress-aggregator-chan
                                                        trigger-chans
                                                        mesos-config
                                                        pool->offer-chan

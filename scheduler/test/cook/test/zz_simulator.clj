@@ -21,6 +21,7 @@
             [cook.datomic :as datomic]
             [cook.mesos :as c]
             [cook.mesos.mesos-mock :as mm]
+            [cook.progress :as progress]
             [cook.scheduler.share :as share]
             [cook.tools :as util]
             [cook.plugins.completion :as completion]
@@ -128,6 +129,9 @@
                                {})
          trigger-chans# (or (:trigger-chans ~scheduler-config)
                             (c/make-trigger-chans rebalancer-config# progress-config# optimizer-config# task-constraints#))
+         progress-update-chans# (or (:progress-update-chans ~scheduler-config)
+                                    (progress/make-progress-update-channels
+                                      (:progress-updater-trigger-chan trigger-chans#) progress-config# conn))
          mesos-heartbeat-chan# (async/chan 1024)
          create-compute-cluster# (fn [compute-cluster-name# framework-id# db-id# driver-atom#]
                                    (mcc/->MesosComputeCluster compute-cluster-name#
@@ -137,6 +141,7 @@
                                                               sandbox-syncer-state#
                                                               exit-code-syncer-state#
                                                               mesos-heartbeat-chan#
+                                                              progress-update-chans#
                                                               trigger-chans#
                                                               {}
                                                               {"no-pool" (async/chan 100)}

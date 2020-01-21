@@ -39,7 +39,6 @@
             [cook.plugins.pool]
             [cook.rest.impersonation :refer (impersonation-authorized-wrapper)]
             [cook.pool :as pool]
-            [cook.progress :as progress]
             ; This explicit require is needed so that mount can see the defstate defined in the cook.rate-limit namespace.
             ; cook.rate-limit and everything else under cook.rest.api is normally hidden from mount's defstate because
             ; cook.rest.api is loaded via util/lazy-load-var, not via 'ns :require'
@@ -285,26 +284,25 @@
                              mesos-agent-query-cache
                              mesos-heartbeat-chan
                              settings
-                             progress-aggregator-chan
+                             progress-update-chans
                              trigger-chans]
-                         (doall (map (fn [{:keys [factory-fn config]}]
-                                       (let [resolved (util/lazy-load-var factory-fn)]
-                                         (log/info "Calling compute cluster factory fn" factory-fn "with config" config)
-                                         (resolved config {:exit-code-syncer-state exit-code-syncer-state
-                                                           :mesos-agent-query-cache mesos-agent-query-cache
-                                                           :mesos-heartbeat-chan mesos-heartbeat-chan
-                                                           :sandbox-syncer-config (:sandbox-syncer settings)
-                                                           :progress-aggregator-chan progress-aggregator-chan
-                                                           :trigger-chans trigger-chans})))
-                                     (:compute-clusters settings))))
-     :progress-aggregator-chan (fnk [trigger-chans
-                                     [:settings [:progress batch-size :as progress-config]]]
-                                 (let [{:keys [progress-updater-trigger-chan]} trigger-chans
-                                       {:keys [progress-state-chan]} (progress/progress-update-transactor
-                                                                       progress-updater-trigger-chan
-                                                                       batch-size
-                                                                       datomic/conn)]
-                                   (progress/progress-update-aggregator progress-config progress-state-chan)))
+                         (mapv (fn [{:keys [factory-fn config]}]
+                                 (let [resolved (util/lazy-load-var factory-fn)]
+                                   (log/info "Calling compute cluster factory fn" factory-fn "with config" config)
+                                   (resolved config {:exit-code-syncer-state exit-code-syncer-state
+                                                     :mesos-agent-query-cache mesos-agent-query-cache
+                                                     :mesos-heartbeat-chan mesos-heartbeat-chan
+                                                     :sandbox-syncer-config (:sandbox-syncer settings)
+                                                     :progress-update-chans progress-update-chans
+                                                     :trigger-chans trigger-chans})))
+                               (:compute-clusters settings)))
+     :progress-update-chans (fnk [trigger-chans
+                                  [:settings [:progress :as progress-config]]]
+                              (let [{:keys [progress-updater-trigger-chan]} trigger-chans]
+                                ;; XXX - Clojure compiler explodes if we eagerly require cook.progress in this namespace...
+                                ;; java.lang.RuntimeException: Can't embed object in code, maybe print-dup not defined: clojure.lang.Delay@18c1d366
+                                ((util/lazy-load-var 'cook.progress/make-progress-update-channels)
+                                 progress-updater-trigger-chan progress-config datomic/conn)))
      :mesos-datomic-mult (fnk []
                            (first ((util/lazy-load-var 'cook.datomic/create-tx-report-mult) datomic/conn)))
      ; TODO(pschorf): Remove hearbeat support

@@ -299,8 +299,8 @@
      :progress-update-chans (fnk [trigger-chans
                                   [:settings [:progress :as progress-config]]]
                               (let [{:keys [progress-updater-trigger-chan]} trigger-chans]
-                                ;; XXX - Clojure compiler explodes if we eagerly require cook.progress in this namespace...
-                                ;; java.lang.RuntimeException: Can't embed object in code, maybe print-dup not defined: clojure.lang.Delay@18c1d366
+                                ;; XXX - We should be able to :require cook.progress rather than using lazy-load-var here,
+                                ;; but there's currently a compile-time bug that prevents that: https://github.com/twosigma/Cook/issues/1370
                                 ((util/lazy-load-var 'cook.progress/make-progress-update-channels)
                                  progress-updater-trigger-chan progress-config datomic/conn)))
      :mesos-datomic-mult (fnk []

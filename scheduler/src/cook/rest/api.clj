@@ -516,6 +516,14 @@
   (assoc JobSubmission
     (s/optional-key :pool) s/Str))
 
+(def JobInstanceProgressRequest
+  "Schema for a POST request to the /progress/:uuid endpoint."
+  (s/both
+    (s/pred (some-fn :progress-message :progress-percent) 'message-or-percent-required)
+    {:progress-sequence s/Int
+     (s/optional-key :progress-message) s/Str
+     (s/optional-key :progress-percent) s/Int}))
+
 (defn- mk-container-params
   "Helper for build-container.  Transforms parameters into the datomic schema."
   [cid params]
@@ -1633,6 +1641,36 @@
                        (comp first))]
     (base-read-instances-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
+(defn update-instance-progress-handler
+  [conn is-authorized-fn leadership-atom leader-selector]
+  (base-cook-handler
+    {:allowed-methods [:post]
+     :service-available? (fn [ctx]
+                           ;; injecting ::instances into ctx for later handlers
+                           (let [instance-uuid (get-in ctx [:request :params :uuid])]
+                             [true {::instances [instance-uuid]}]))
+     :allowed? (partial instance-request-allowed? conn is-authorized-fn)
+     :exists? (constantly false)  ;; triggers path for moved-temporarily?
+     :existed? instance-request-exists?
+     :can-post-to-missing? (constantly false)
+     :moved-temporarily? (fn [ctx]
+                           ;; only the leader handles progress updates
+                           ;; the client is expected to cache the redirect location
+                           (let [request-path (get-in ctx [:request :uri])]
+                             (if @leadership-atom
+                               [false {}]
+                               [true {:location (str (leader-url leader-selector) request-path)}])))
+     :handle-moved-temporarily (fn [ctx] {:location (:location ctx) :message "redirecting to master"})
+     :can-post-to-gone? (constantly true)
+     :post! (fn [ctx]
+              (comment "XXX - Thread request body into update aggregator channel")
+              (get-in ctx [:request :body-params]))
+     :post-enacted? (constantly false)  ;; triggers http 202 "accepted" response
+     :handle-accepted (fn [ctx]
+                        (let [instance (-> ctx ::instances first)
+                              job (-> ctx ::jobs first)]
+                          {:instance instance :job job :message "progress update accepted"}))}))
+
 ;;; On DELETE; use repeated job argument
 (defn destroy-jobs-handler
   [conn is-authorized-fn]
@@ -2277,7 +2315,7 @@
      ;; :new? decides whether to respond with Created (true) or OK (false).
      :new? (comp seq ::jobs)
      :respond-with-entity? (constantly true)
-     ;; :handle-ok and :handle-accepted both return the number of jobs to be retried,
+     ;; :handle-ok and :handle-created both return the number of jobs to be retried,
      ;; but :handle-ok is only triggered when there are no failed jobs to retry.
      :handle-created (partial display-retries conn)
      :handle-ok (constantly 0)}))
@@ -2853,6 +2891,7 @@
         body-matchers (merged-matchers
                         {;; can't use form->kebab-case because env and label
                          ;; accept arbitrary kvs
+                         JobInstanceProgressRequest (partial pc/map-keys ->kebab-case)
                          JobRequestMap (partial pc/map-keys ->kebab-case)
                          Group (partial pc/map-keys ->kebab-case)
                          HostPlacement (fn [hp]
@@ -3142,7 +3181,24 @@
              :responses {200 {:schema PoolsResponse
                               :description "The pools were returned."}}
              :get {:summary "Returns the pools."
-                   :handler (pools-handler)}})))
+                   :handler (pools-handler)}}))
+
+        (c-api/undocumented
+          ;; internal api endpoints (don't include in swagger)
+          (c-api/context
+            "/progress/:uuid" [uuid]
+            :path-params [uuid :- s/Uuid]
+            (c-api/resource
+              ;; NOTE: The authentication for this endpoint is disabled via cook.components/conditional-auth-bypass
+              {:post {:summary "Update the progress of a Job Instance"
+                      :parameters {:body-params JobInstanceProgressRequest}
+                      :responses {202 {:description "The progress update was accepted."}
+                                  307 {:description "Redirecting request to leader node."}
+                                  400 {:description "Invalid request format."}
+                                  404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
+                      :handler (let [;; TODO: add lightweight auth -- https://github.com/twosigma/Cook/issues/1367
+                                     mock-auth-fn (constantly true)]
+                                 (update-instance-progress-handler conn mock-auth-fn leadership-atom leader-selector))}}))))
 
       ; Data locality debug endpoints
       (c-api/context
@@ -3161,6 +3217,7 @@
            :responses {200 {:schema DataLocalUpdateTimeResponse}}
            :get {:summary "Returns summary information on the current data locality status"
                  :handler (data-local-update-time-handler conn)}}))
+
 
       (ANY "/queue" []
         (waiting-jobs conn mesos-pending-jobs-fn is-authorized-fn leadership-atom leader-selector))

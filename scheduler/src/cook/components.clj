@@ -81,6 +81,8 @@
 (def raw-scheduler-routes
   {:scheduler (fnk [mesos leadership-atom pool-name->pending-jobs-atom settings]
                 ((util/lazy-load-var 'cook.rest.api/main-handler)
+                  ;; XXX probably need to thread the aggregator through to my new endpoint from here,
+                  ;; but I'll also need to thread it through to where it's currently constructed in mesos land
                   datomic/conn
                   (fn [] @pool-name->pending-jobs-atom)
                   settings
@@ -208,9 +210,10 @@
 (defn conditional-auth-bypass
   "Skip authentication on some hard-coded endpoints."
   [h auth-middleware]
-  (let [auth-fn (auth-middleware h)]
+  (let [auth-fn (auth-middleware h)
+        no-auth-pattern #"/(?:info|progress/[-\w]+)"]
     (fn filtered-auth [{:keys [uri request-method] :as req}]
-      (if (and (= "/info" uri) (= :get request-method))
+      (if (re-matches no-auth-pattern uri)
         (h req)
         (auth-fn req)))))
 

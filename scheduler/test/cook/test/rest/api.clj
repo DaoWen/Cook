@@ -96,7 +96,8 @@
                                      :mesos-gpu-enabled gpus-enabled
                                      :task-constraints {:cpus cpus :memory-gb memory-gb :retry-limit retry-limit}}
                                     (Object.)
-                                    (atom true))]
+                                    (atom true)
+                                    {:progress-aggregator-chan (async/chan)})]
       (with-redefs [api/retrieve-sandbox-url-path (fn [{:keys [instance/hostname instance/task-id]}]
                                                     (str "http://" hostname "/" task-id))
                     rate-limit/job-submission-rate-limiter rate-limit/AllowAllRateLimiter]

@@ -2940,7 +2940,8 @@
     gpu-enabled? :mesos-gpu-enabled
     :as settings}
    leader-selector
-   leadership-atom]
+   leadership-atom
+   {:keys [progress-aggregator-chan]}]
   (->
     (routes
       (c-api/api

@@ -44,6 +44,7 @@
             [cook.plugins.definitions :as plugins]
             [cook.plugins.file :as file-plugin]
             [cook.plugins.submission :as submission-plugin]
+            [cook.progress :as progress]
             [cook.rate-limit :as rate-limit]
             [cook.task :as task]
             [cook.util :refer [ZeroInt PosNum NonNegNum PosInt NonNegInt PosDouble UserName NonEmptyString]]
@@ -1642,7 +1643,7 @@
     (base-read-instances-handler conn is-authorized-fn {:handle-ok handle-ok})))
 
 (defn update-instance-progress-handler
-  [conn is-authorized-fn leadership-atom leader-selector]
+  [conn is-authorized-fn leadership-atom leader-selector progress-aggregator-chan]
   (base-cook-handler
     {:allowed-methods [:post]
      :service-available? (fn [ctx]
@@ -1663,8 +1664,11 @@
      :handle-moved-temporarily (fn [ctx] {:location (:location ctx) :message "redirecting to master"})
      :can-post-to-gone? (constantly true)
      :post! (fn [ctx]
-              (comment "XXX - Thread request body into update aggregator channel")
-              (get-in ctx [:request :body-params]))
+              (let [progress-message-map (-> (get-in ctx [:request :body-params])
+                                             (assoc :instance-id instance-db-id))
+                    task-id (-> ctx ::instances first)]
+                (progress/handle-progress-message!
+                  (d/db conn) task-id progress-aggregator-chan progress-message-map)))
      :post-enacted? (constantly false)  ;; triggers http 202 "accepted" response
      :handle-accepted (fn [ctx]
                         (let [instance (-> ctx ::instances first)
@@ -3199,7 +3203,8 @@
                                   404 {:description "The supplied UUID doesn't correspond to a valid job instance."}}
                       :handler (let [;; TODO: add lightweight auth -- https://github.com/twosigma/Cook/issues/1367
                                      mock-auth-fn (constantly true)]
-                                 (update-instance-progress-handler conn mock-auth-fn leadership-atom leader-selector))}}))))
+                                 (update-instance-progress-handler
+                                   conn mock-auth-fn leadership-atom leader-selector progress-aggregator-chan))}}))))
 
       ; Data locality debug endpoints
       (c-api/context

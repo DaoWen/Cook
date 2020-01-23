@@ -1423,9 +1423,13 @@
 
 (def leader-hostname-regex #"^([^#]*)#([0-9]*)#([a-z]*)#.*")
 
+(defn leader-selector->leader-id
+  [leader-selector]
+  (-> leader-selector .getLeader .getId))
+
 (defn leader-url
   [leader-selector]
-  (let [leader-id (-> leader-selector .getLeader .getId)
+  (let [leader-id (leader-selector->leader-id leader-selector)
         leader-match (re-matcher leader-hostname-regex leader-id)]
     (if (.matches leader-match)
       (let [leader-hostname (.group leader-match 1)
@@ -1664,8 +1668,7 @@
      :handle-moved-temporarily (fn [ctx] {:location (:location ctx) :message "redirecting to master"})
      :can-post-to-gone? (constantly true)
      :post! (fn [ctx]
-              (let [progress-message-map (-> (get-in ctx [:request :body-params])
-                                             (assoc :instance-id instance-db-id))
+              (let [progress-message-map (get-in ctx [:request :body-params])
                     task-id (-> ctx ::instances first)]
                 (progress/handle-progress-message!
                   (d/db conn) task-id progress-aggregator-chan progress-message-map)))
@@ -2857,7 +2860,7 @@
      :handle-ok (fn [{:keys [costs]}]
                   costs)}))
 
-(defn- streaming-json-encoder
+(defn streaming-json-encoder
   "Takes as input the response body which can be converted into JSON,
   and returns a function which takes a ServletResponse and writes the JSON
   encoded response data. This is suitable for use with jet's server API."

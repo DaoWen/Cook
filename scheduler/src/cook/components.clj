@@ -81,8 +81,6 @@
 (def raw-scheduler-routes
   {:scheduler (fnk [mesos leadership-atom pool-name->pending-jobs-atom progress-update-chans settings]
                 ((util/lazy-load-var 'cook.rest.api/main-handler)
-                  ;; XXX probably need to thread the aggregator through to my new endpoint from here,
-                  ;; but I'll also need to thread it through to where it's currently constructed in mesos land
                   datomic/conn
                   (fn [] @pool-name->pending-jobs-atom)
                   settings

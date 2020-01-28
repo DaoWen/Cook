@@ -531,7 +531,9 @@
         (.setWorkingDir container fileserver-workdir)
         (.setPorts container [(.containerPort (V1ContainerPort.) (int port))])
 
-        (.setEnv container [(make-env "COOK_WORKDIR" workdir)])
+        (.setEnv container [(make-env "COOK_INSTANCE_ID" task-id)
+                            (make-env "COOK_SCHEDULER_REST_URL" (config/scheduler-rest-url))
+                            (make-env "COOK_WORKDIR" workdir)])
 
         (.setPort http-get-action (IntOrString. port))
         (.setPath http-get-action "readiness-probe")

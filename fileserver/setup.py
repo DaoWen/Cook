@@ -6,7 +6,9 @@ from cook import version
 
 requirements = [
     'Flask==1.1.0',
-    'gunicorn==19.9.0'
+    'gunicorn==19.9.0',
+    'requests==2.20.0',
+    'retrying==1.3.3',
 ]
 
 test_requirements = [

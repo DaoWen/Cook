@@ -17,8 +17,6 @@ from cook.progress._version import __version__
 
 
 def start_progress_trackers():
-    progress_trackers = []
-
     try:
         logging.info(f'Cook Progress Reporter version {__version__}')
         environment = os.environ
@@ -27,8 +25,7 @@ def start_progress_trackers():
         config = cc.initialize_config(environment)
 
         def send_progress_message(message):
-            logging.info(f'Sending message with sequence number {message["sequence-number"]}')
-            requests.post(cook_progress_url, json=message)
+            requests.post(config.callback_url, json=message)
 
         max_message_length = config.max_message_length
         sample_interval_ms = config.progress_sample_interval_ms
@@ -63,17 +60,24 @@ def start_progress_trackers():
 
         signal.signal(signal.SIGUSR1, dump_traceback)
 
+        return progress_trackers
+
     except Exception:
         logging.exception('Error starting Progress Reporter')
-
-    return progress_trackers
+        return None
 
 
 def main(args=None):
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
         print(__version__)
     else:
+        log_level = os.environ.get('EXECUTOR_LOG_LEVEL', 'INFO')
+        logging.basicConfig(level = log_level,
+                            stream = sys.stderr,
+                            format='%(asctime)s %(levelname)s %(message)s')
         progress_trackers = start_progress_trackers()
+        if progress_trackers is None:
+            sys.exit('Failed to start progress trackers')
         # wait for all background threads to exit
         # (but this process will probably be killed first instead)
         for progress_tracker in progress_trackers:

@@ -26,12 +26,23 @@ import os
 import sys
 
 from cook.file_server import FileServerApplication
+from cook.progress import __main__ as progress
 from cook.version import VERSION
 
 
 def main(args=None):
+    progress_reporter_enabled = True
+
     if args is None:
         args = sys.argv[1:]
+
+    if len(args) > 0 and args[0] == '--no-progress-reporting':
+        args = args[1:]
+        progress_reporter_enabled = False
+
+    if progress_reporter_enabled:
+        progress.start_progress_trackers()
+
     try:
         logging.info(f'Starting cook.file_server {VERSION}')
         port, workers = (args + [None] * 2)[0:2]

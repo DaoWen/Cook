@@ -10,6 +10,7 @@ class ProgressReporterConfig(object):
     """This class is responsible for storing the progress reporter config."""
 
     def __init__(self,
+                 callback_url,
                  max_bytes_read_per_line=1024,
                  max_message_length=512,
                  progress_output_env_variable=DEFAULT_PROGRESS_FILE_ENV_VARIABLE,
@@ -17,6 +18,7 @@ class ProgressReporterConfig(object):
                  progress_regex_string='',
                  progress_sample_interval_ms=100,
                  sandbox_directory=''):
+        self.callback_url = callback_url
         self.max_bytes_read_per_line = max_bytes_read_per_line
         self.max_message_length = max_message_length
         self.progress_output_env_variable = progress_output_env_variable
@@ -43,7 +45,13 @@ def initialize_config(environment):
     if task_id is None:
         raise Exception('Task unknown! COOK_INSTANCE_ID not set in environment.')
 
-    sandbox_directory = environment.get('MESOS_SANDBOX', '')
+    cook_scheduler_rest_url = environment.get('COOK_SCHEDULER_REST_URL')
+    if cook_scheduler_rest_url is None:
+        raise Exception('REST URL unknown! COOK_SCHEDULER_REST_URL not set in environment.')
+
+    callback_url = f'{cook_scheduler_rest_url}/progress/{task_id}'
+
+    sandbox_directory = environment.get('COOK_WORKDIR', '')
     default_progress_output_key = 'EXECUTOR_DEFAULT_PROGRESS_OUTPUT_NAME'
     default_progress_output_name = environment.get(default_progress_output_key, f'{task_id}.progress')
     if sandbox_directory:
@@ -53,25 +61,27 @@ def initialize_config(environment):
 
     progress_output_env_key = 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV'
     progress_output_env_variable = environment.get(progress_output_env_key, DEFAULT_PROGRESS_FILE_ENV_VARIABLE)
-    logging.info('Progress location environment variable is {}'.format(progress_output_env_variable))
+    logging.info(f'Progress location environment variable is {progress_output_env_variable}')
     if progress_output_env_variable not in environment:
-        logging.info('No entry found for {} in the environment'.format(progress_output_env_variable))
+        logging.info(f'No entry found for {progress_output_env_variable} in the environment')
 
     max_bytes_read_per_line = max(int(environment.get('EXECUTOR_MAX_BYTES_READ_PER_LINE', 4 * 1024)), 128)
     max_message_length = max(int(environment.get('EXECUTOR_MAX_MESSAGE_LENGTH', 512)), 64)
     progress_output_name = environment.get(progress_output_env_variable, default_progress_output_file)
     progress_regex_string = environment.get('PROGRESS_REGEX_STRING', r'progress: ([0-9]*\.?[0-9]+), (.*)')
     progress_sample_interval_ms = max(int(environment.get('PROGRESS_SAMPLE_INTERVAL_MS', 1000)), 100)
-    sandbox_directory = environment.get('MESOS_SANDBOX', '')
+    sandbox_directory = environment.get('COOK_WORKDIR', '')
 
-    logging.info('Max bytes read per line is {}'.format(max_bytes_read_per_line))
-    logging.info('Progress message length is limited to {}'.format(max_message_length))
-    logging.info('Progress output file is {}'.format(progress_output_name))
-    logging.info('Progress regex is {}'.format(progress_regex_string))
-    logging.info('Progress sample interval is {}'.format(progress_sample_interval_ms))
-    logging.info('Sandbox location is {}'.format(sandbox_directory))
+    logging.info(f'Progress update callback url is {callback_url}')
+    logging.info(f'Max bytes read per line is {max_bytes_read_per_line}')
+    logging.info(f'Progress message length is limited to {max_message_length}')
+    logging.info(f'Progress output file is {progress_output_name}')
+    logging.info(f'Progress regex is {progress_regex_string}')
+    logging.info(f'Progress sample interval is {progress_sample_interval_ms}')
+    logging.info(f'Sandbox location is {sandbox_directory}')
 
-    return ProgressReporterConfig(max_bytes_read_per_line=max_bytes_read_per_line,
+    return ProgressReporterConfig(callback_url=callback_url,
+                                  max_bytes_read_per_line=max_bytes_read_per_line,
                                   max_message_length=max_message_length,
                                   progress_output_env_variable=progress_output_env_variable,
                                   progress_output_name=progress_output_name,

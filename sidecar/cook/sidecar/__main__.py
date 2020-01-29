@@ -25,12 +25,17 @@ import logging
 import os
 import sys
 
-from cook.file_server import FileServerApplication
-from cook.progress import __main__ as progress
-from cook.version import VERSION
+from cook.sidecar import progress
+from cook.sidecar.file_server import FileServerApplication
+from cook.sidecar.version import __version__
 
 
 def main(args=None):
+    log_level = os.environ.get('COOK_SIDECAR_LOG_LEVEL', 'INFO')
+    logging.basicConfig(level = log_level,
+                        stream = sys.stderr,
+                        format='%(asctime)s %(levelname)s %(message)s')
+
     progress_reporter_enabled = True
 
     if args is None:
@@ -40,16 +45,17 @@ def main(args=None):
         args = args[1:]
         progress_reporter_enabled = False
 
+    logging.info(f'Starting cook.sidecar {__version__}')
+
     if progress_reporter_enabled:
         progress.start_progress_trackers()
 
     try:
-        logging.info(f'Starting cook.file_server {VERSION}')
         port, workers = (args + [None] * 2)[0:2]
         if port is None:
-            logging.error('Must provide port')
+            logging.error('Must provide fileserver port')
             sys.exit(1)
-        cook_workdir = os.getenv('COOK_WORKDIR')
+        cook_workdir = os.environ.get('COOK_WORKDIR')
         if not cook_workdir:
             logging.error('COOK_WORKDIR environment variable must be set')
             sys.exit(1)

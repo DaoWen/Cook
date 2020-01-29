@@ -570,7 +570,7 @@
 
 (defn scheduler-rest-url
   "Get the URL for REST calls back to the Cook Scheduler API.
-   Used by Kubernetes pod sidecars to send messages back to Cook."
+   Used by Kubernetes pod sidecar to send messages back to Cook."
   []
   (get-in config [:settings :scheduler-rest-url]))
 

@@ -32,7 +32,7 @@ from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 sandbox_directory = None
-max_read_length = int(os.getenv('COOK_FILE_SERVER_MAX_READ_LENGTH', '25000000'))
+max_read_length = int(os.environ.get('COOK_FILE_SERVER_MAX_READ_LENGTH', '25000000'))
 
 
 class FileServerApplication(gunicorn.app.base.BaseApplication):
@@ -146,8 +146,8 @@ def browse():
     return jsonify(sorted(retval, key=itemgetter("path")))
 
 
-# This endpoint is not part of the Mesos API. It is used by the kubernetes readiness probe on the fileserver container.
-# Cook will see that the fileserver is ready to serve files and will set the output_url. If we expose the output_url
+# This endpoint is not part of the Mesos API. It is used by the kubernetes readiness probe on the sidecar container.
+# Cook will see that the sidecar is ready to serve files and will set the output_url. If we expose the output_url
 # before the server is ready, then someone might use it and get an error.
 @app.route('/readiness-probe')
 def readiness_probe():

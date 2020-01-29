@@ -41,19 +41,19 @@ def initialize_config(environment):
     """Initializes the config using the environment.
     Populates the default values for missing environment variables.
     """
-    task_id = environment.get('COOK_INSTANCE_ID')
-    if task_id is None:
-        raise Exception('Task unknown! COOK_INSTANCE_ID not set in environment.')
+    instance_id = environment.get('COOK_INSTANCE_UUID')
+    if instance_id is None:
+        raise Exception('Task unknown! COOK_INSTANCE_UUID not set in environment.')
 
     cook_scheduler_rest_url = environment.get('COOK_SCHEDULER_REST_URL')
     if cook_scheduler_rest_url is None:
         raise Exception('REST URL unknown! COOK_SCHEDULER_REST_URL not set in environment.')
 
-    callback_url = f'{cook_scheduler_rest_url}/progress/{task_id}'
+    callback_url = f'{cook_scheduler_rest_url}/progress/{instance_id}'
 
     sandbox_directory = environment.get('COOK_WORKDIR', '')
     default_progress_output_key = 'EXECUTOR_DEFAULT_PROGRESS_OUTPUT_NAME'
-    default_progress_output_name = environment.get(default_progress_output_key, f'{task_id}.progress')
+    default_progress_output_name = environment.get(default_progress_output_key, f'{instance_id}.progress')
     if sandbox_directory:
         default_progress_output_file = os.path.join(sandbox_directory, default_progress_output_name)
     else:

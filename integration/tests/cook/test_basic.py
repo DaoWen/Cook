@@ -563,7 +563,7 @@ class CookTest(util.CookTest):
         else:
             self.logger.info(f'Exit code not checked because cook executor was not used for {instance}')
 
-    @unittest.skipUnless(util.is_cook_executor_in_use(), 'Test assumes the Cook Executor is in use')
+    @unittest.skipUnless(util.is_job_progress_supported(), 'Test depends on progress reporting')
     def test_progress_update_submit(self):
         job_executor_type = util.get_job_executor_type()
         progress_file_env = util.retrieve_progress_file_env(self.cook_url)
@@ -579,7 +579,6 @@ class CookTest(util.CookTest):
         message = json.dumps(instance, sort_keys=True)
         self.assertIsNotNone(instance['output_url'], message)
         self.assertIsNotNone(instance['sandbox_directory'], message)
-        self.assertEqual('cook', instance['executor'])
         util.sleep_for_publish_interval(self.cook_url)
         job = util.wait_until(lambda: util.load_job(self.cook_url, job_uuid),
                               lambda j: util.job_progress_is_present(j, 25))
@@ -587,7 +586,7 @@ class CookTest(util.CookTest):
         self.assertEqual(25, instance['progress'], message)
         self.assertEqual('Twenty-five percent in progress.txt', instance['progress_message'], message)
 
-    @unittest.skipUnless(util.is_cook_executor_in_use(), 'Test assumes the Cook Executor is in use')
+    @unittest.skipUnless(util.is_job_progress_supported(), 'Test depends on progress reporting')
     def test_configurable_progress_update_submit(self):
         job_executor_type = util.get_job_executor_type()
         command = 'echo "message: 25 Twenty-five percent" > progress_file.txt; sleep 1; exit 0'
@@ -613,7 +612,7 @@ class CookTest(util.CookTest):
         self.assertEqual(25, instance['progress'], message)
         self.assertEqual('Twenty-five percent', instance['progress_message'], message)
 
-    @unittest.skipUnless(util.is_cook_executor_in_use(), 'Test assumes the Cook Executor is in use')
+    @unittest.skipUnless(util.is_job_progress_supported(), 'Test depends on progress reporting')
     def test_multiple_progress_updates_submit(self):
         job_executor_type = util.get_job_executor_type()
         line_1 = util.progress_line(self.cook_url, 25, 'Twenty-five percent', True)
@@ -674,7 +673,7 @@ class CookTest(util.CookTest):
         self.assertEqual(75, instance['progress'], message)
         self.assertEqual('Seventy-five percent', instance['progress_message'], message)
 
-    @unittest.skipUnless(util.is_cook_executor_in_use(), 'Test assumes the Cook Executor is in use')
+    @unittest.skipUnless(util.is_job_progress_supported(), 'Test depends on progress reporting')
     def test_multiple_rapid_progress_updates_submit(self):
         job_executor_type = util.get_job_executor_type()
 

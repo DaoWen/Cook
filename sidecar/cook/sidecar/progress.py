@@ -11,30 +11,26 @@ import requests
 import signal
 import sys
 
-import cook.progress.config as cc
-import cook.progress.progress as cp
-from cook.progress._version import __version__
+import cook.sidecar.config as csc
+import cook.sidecar.tracker as cst
+from cook.sidecar.version import __version__
 
 
 def start_progress_trackers():
     try:
-        logging.info(f'Cook Progress Reporter version {__version__}')
-        environment = os.environ
-        sandbox_directory = environment.get('MESOS_SANDBOX', '.')
-        logging.info('Starting Cook Progress Reporter {__version__}')
-        config = cc.initialize_config(environment)
+        config = csc.initialize_config(os.environ)
 
         def send_progress_message(message):
             requests.post(config.callback_url, json=message)
 
         max_message_length = config.max_message_length
         sample_interval_ms = config.progress_sample_interval_ms
-        sequence_counter = cp.ProgressSequenceCounter()
-        progress_updater = cp.ProgressUpdater(max_message_length, sample_interval_ms, send_progress_message)
+        sequence_counter = cst.ProgressSequenceCounter()
+        progress_updater = cst.ProgressUpdater(max_message_length, sample_interval_ms, send_progress_message)
 
         def launch_progress_tracker(progress_location, location_tag):
             logging.info(f'Location {progress_location} tagged as [tag={location_tag}]')
-            progress_tracker = cp.ProgressTracker(config, sequence_counter, progress_updater, progress_location, location_tag)
+            progress_tracker = cst.ProgressTracker(config, sequence_counter, progress_updater, progress_location, location_tag)
             progress_tracker.start()
             return progress_tracker
 
@@ -68,10 +64,11 @@ def start_progress_trackers():
 
 
 def main(args=None):
+    logging.info(f'Starting cook.sidecar {__version__} progress reporter')
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
         print(__version__)
     else:
-        log_level = os.environ.get('EXECUTOR_LOG_LEVEL', 'INFO')
+        log_level = os.environ.get('SIDECAR_LOG_LEVEL', 'INFO')
         logging.basicConfig(level = log_level,
                             stream = sys.stderr,
                             format='%(asctime)s %(levelname)s %(message)s')

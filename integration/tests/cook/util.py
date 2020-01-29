@@ -1330,6 +1330,14 @@ def is_cook_executor_in_use():
         return False
 
 
+@functools.lru_cache()
+def is_job_progress_supported():
+    """Returns true if the current job execution environment supports progress reporting"""
+    # Mesos supports progress reporting only with Cook Executor,
+    # but our progress reporter sidecar is always enabled on Kubernetes.
+    return is_cook_executor_in_use() or using_kubernetes()
+
+
 def slave_cpus(mesos_url, hostname):
     """Returns the cpus of the specified Mesos agent"""
     slaves = get_mesos_slaves(mesos_url)['slaves']

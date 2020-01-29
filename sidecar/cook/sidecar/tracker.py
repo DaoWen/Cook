@@ -271,7 +271,7 @@ class ProgressTracker(object):
 
         Parameters
         ----------
-        config: cook.config.ExecutorConfig
+        config: cook.sidecar.config.ExecutorConfig
             The current executor config.
         progress_updater: ProgressUpdater
             The progress updater used to send the progress messages

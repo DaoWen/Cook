@@ -11,16 +11,18 @@ class ProgressReporterConfig(object):
 
     def __init__(self,
                  callback_url,
-                 max_bytes_read_per_line=1024,
-                 max_message_length=512,
-                 progress_output_env_variable=DEFAULT_PROGRESS_FILE_ENV_VARIABLE,
-                 progress_output_name='stdout',
-                 progress_regex_string='',
-                 progress_sample_interval_ms=100,
-                 sandbox_directory=''):
+                 max_bytes_read_per_line,
+                 max_message_length,
+                 max_post_redirect_follow,
+                 progress_output_env_variable,
+                 progress_output_name,
+                 progress_regex_string,
+                 progress_sample_interval_ms,
+                 sandbox_directory):
         self.callback_url = callback_url
         self.max_bytes_read_per_line = max_bytes_read_per_line
         self.max_message_length = max_message_length
+        self.max_post_redirect_follow = max_post_redirect_follow
         self.progress_output_env_variable = progress_output_env_variable
         self.progress_output_name = progress_output_name
         self.progress_regex_string = progress_regex_string
@@ -67,6 +69,7 @@ def initialize_config(environment):
 
     max_bytes_read_per_line = max(int(environment.get('EXECUTOR_MAX_BYTES_READ_PER_LINE', 4 * 1024)), 128)
     max_message_length = max(int(environment.get('EXECUTOR_MAX_MESSAGE_LENGTH', 512)), 64)
+    max_post_redirect_follow = max(int(environment.get('PROGRESS_MAX_POST_REDIRECTS', 5)), 1)
     progress_output_name = environment.get(progress_output_env_variable, default_progress_output_file)
     progress_regex_string = environment.get('PROGRESS_REGEX_STRING', r'progress: ([0-9]*\.?[0-9]+), (.*)')
     progress_sample_interval_ms = max(int(environment.get('PROGRESS_SAMPLE_INTERVAL_MS', 1000)), 100)
@@ -84,6 +87,7 @@ def initialize_config(environment):
     return ProgressReporterConfig(callback_url=callback_url,
                                   max_bytes_read_per_line=max_bytes_read_per_line,
                                   max_message_length=max_message_length,
+                                  max_post_redirect_follow=max_post_redirect_follow,
                                   progress_output_env_variable=progress_output_env_variable,
                                   progress_output_name=progress_output_name,
                                   progress_regex_string=progress_regex_string,

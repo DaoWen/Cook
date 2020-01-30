@@ -20,9 +20,29 @@ def start_progress_trackers():
     try:
         config = csc.initialize_config(os.environ)
 
+        default_url = config.callback_url
+        current_url = default_url
+
         def send_progress_message(message):
-            response = requests.post(config.callback_url, allow_redirects=True, json=message)
-            return response.status_code == 202
+            nonlocal current_url
+            try:
+                for i in range(config.max_post_redirect_follow + 1):
+                    response = requests.post(current_url, allow_redirects=False, json=message)
+                    if response.status_code == 202:
+                        return True
+                    elif response.is_redirect and response.status_code == 307:
+                        current_url = response.headers['location']
+                        logging.info(f'Redirected! Changed progress update callback url to: {current_url}')
+                    else:
+                        logging.warning(f'Unexpected progress update response ({response.status_code}): {response.content}')
+                        break
+                else:
+                    logging.warning(f'Reached max redirect retries ({config.max_post_redirect_follow})')
+            except Exception:
+                logging.exception(f'Error raised while posting progress update to {current_url}')
+            current_url = default_url
+            logging.info(f'Failed to post progress update. Reset progress update callback url: {current_url}')
+            return False
 
         max_message_length = config.max_message_length
         sample_interval_ms = config.progress_sample_interval_ms

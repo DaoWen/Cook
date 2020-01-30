@@ -85,11 +85,11 @@ class ProgressUpdater(object):
         with self.lock:
             # ensure we do not send outdated progress data due to parallel repeated calls to this method
             if progress_data is None or not self.is_increasing_sequence(progress_data):
-                logging.info('Skipping invalid/outdated progress data {}'.format(progress_data))
+                logging.info(f'Skipping invalid/outdated progress data {progress_data}')
             elif not force_send and not self.has_enough_time_elapsed_since_last_update():
                 logging.debug('Not sending progress data as enough time has not elapsed since last update')
             else:
-                logging.info('Sending progress message {}'.format(progress_data))
+                logging.info(f'Sending progress message {progress_data}')
                 message_dict = dict(progress_data)
 
                 raw_progress_message = progress_data['progress-message']
@@ -104,7 +104,7 @@ class ProgressUpdater(object):
                 else:
                     allowed_progress_message_length = max(self.max_message_length - 3, 0)
                     new_progress_str = progress_str[:allowed_progress_message_length].strip() + '...'
-                    logging.info('Progress message trimmed to {}'.format(new_progress_str))
+                    logging.info(f'Progress message trimmed to {new_progress_str}')
                     message_dict['progress-message'] = new_progress_str
 
                 send_success = self.send_progress_message(message_dict)
@@ -112,7 +112,7 @@ class ProgressUpdater(object):
                     self.last_progress_data_sent = progress_data
                     self.last_reported_time = time.time()
                 else:
-                    logging.info('Unable to send progress message {}'.format(message_dict))
+                    logging.info(f'Unable to send progress message {message_dict}')
 
 
 class ProgressWatcher(object):
@@ -160,20 +160,20 @@ class ProgressWatcher(object):
             sleep_param = sleep_time_ms / 1000
 
             if os.path.exists(self.target_file) and not os.path.isfile(self.target_file):
-                logging.info('Skipping progress monitoring on %s as it is not a file', self.target_file)
+                logging.info(f'Skipping progress monitoring on {self.target_file} as it is not a file')
                 return
 
             if not os.path.isfile(self.target_file):
-                logging.debug('Awaiting creation of file %s [tag=%s]', self.target_file, self.location_tag)
+                logging.debug(f'Awaiting creation of file {self.target_file} [tag={self.location_tag}]')
 
             while not os.path.isfile(self.target_file):
                 time.sleep(sleep_param)
 
             if not os.path.isfile(self.target_file):
-                logging.info('Progress output file has not been created [tag={self.location_tag}]')
+                logging.info(f'Progress output file has not been created [tag={self.location_tag}]')
                 return
 
-            logging.info('File has been created, reading contents [tag={self.location_tag}]')
+            logging.info(f'File has been created, reading contents [tag={self.location_tag}]')
             linesep_bytes = os.linesep.encode()
             fragment_index = 0
             line_index = 0
@@ -192,7 +192,7 @@ class ProgressWatcher(object):
                     yield line
 
         except Exception as exception:
-            logging.exception('Error while tailing %s [tag=%s]', self.target_file, self.location_tag)
+            logging.exception(f'Error while tailing {self.target_file} [tag={self.location_tag}]')
             raise exception
 
     def match_progress_update(self, input_data):
@@ -222,11 +222,11 @@ class ProgressWatcher(object):
 
         percent_float = float(percent_data.decode())
         if percent_float < 0 or percent_float > 100:
-            logging.info('Skipping "%s" as the percent is not in [0, 100]', progress_report)
+            logging.info(f'Skipping "{progress_report}" as the percent is not in [0, 100]')
             return False
 
         percent_int = int(round(percent_float))
-        logging.debug('Updating progress to %s percent [tag=%s]', percent_int, self.location_tag)
+        logging.debug(f'Updating progress to {percent_int} percent [tag={self.location_tag}]')
 
         self.progress = {'progress-message': message_data,
                          'progress-percent': percent_int,
@@ -288,7 +288,7 @@ class ProgressTracker(object):
 
     def start(self):
         """Launches a thread that starts monitoring the progress location for progress messages."""
-        logging.info('Starting progress monitoring from [tag={self.location_tag}]')
+        logging.info(f'Starting progress monitoring from [tag={self.location_tag}]')
         self.tracker_thread.start()
 
     def join(self):
@@ -302,7 +302,7 @@ class ProgressTracker(object):
             for current_progress in self.watcher.retrieve_progress_states():
                 self.updater.send_progress_update(current_progress)
         except Exception:
-            logging.exception('Exception while tracking progress [tag={self.location_tag}]')
+            logging.exception(f'Exception while tracking progress [tag={self.location_tag}]')
 
     def force_send_progress_update(self):
         """Retrieves the latest progress message and attempts to force send it to the scheduler."""

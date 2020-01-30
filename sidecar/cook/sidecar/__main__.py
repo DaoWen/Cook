@@ -65,7 +65,7 @@ def main(args=None):
         }).run()
 
     except Exception as e:
-        logging.exception('exception when running with %s' % args)
+        logging.exception(f'exception when running with {args}')
         sys.exit(1)
 
 

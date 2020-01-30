@@ -19,7 +19,7 @@ setup(
     description="Two Sigma's Cook Sidecar",
     long_description="This package contains Two Sigma's Cook Sidecar. "
                      "The primary purposes are to serve log files and report job progress.",
-    packages=['cook'],
+    packages=['cook.sidecar'],
     entry_points={'console_scripts': ['cook-sidecar = cook.sidecar.__main__:main']},
     install_requires=requirements,
     tests_require=test_requirements

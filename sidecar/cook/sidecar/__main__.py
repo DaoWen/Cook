@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-#  Copyright (c) 2019 Two Sigma Open Source, LLC
+#  Copyright (c) 2020 Two Sigma Open Source, LLC
 #
 #  Permission is hereby granted, free of charge, to any person obtaining a copy
 #  of this software and associated documentation files (the "Software"), to
@@ -25,49 +25,42 @@ import logging
 import os
 import sys
 
+from cook.sidecar import file_server
 from cook.sidecar import progress
-from cook.sidecar.file_server import FileServerApplication
 from cook.sidecar.version import __version__
 
 
 def main(args=None):
-    log_level = os.environ.get('COOK_SIDECAR_LOG_LEVEL', 'INFO')
+    log_level = os.environ.get('EXECUTOR_LOG_LEVEL', 'INFO')
     logging.basicConfig(level = log_level,
                         stream = sys.stderr,
                         format='%(asctime)s %(levelname)s %(message)s')
 
-    progress_reporter_enabled = True
-
     if args is None:
         args = sys.argv[1:]
 
-    if len(args) > 0 and args[0] == '--no-progress-reporting':
-        args = args[1:]
-        progress_reporter_enabled = False
+    progress_reporter_enabled = True
+    file_server_enabled = True
+
+    while len(args) > 0 and args[0].startswith('--no-'):
+        if args[0] == '--no-file-server':
+            file_server_enabled = False
+        elif args[0] == '--no-progress-reporting':
+            progress_reporter_enabled = False
+        else:
+            logging.warning(f'Ignoring unrecognized flag: {args[0]}')
+        args.pop(0)
 
     logging.info(f'Starting cook.sidecar {__version__}')
 
     if progress_reporter_enabled:
-        progress.start_progress_trackers()
+        progress_trackers = progress.start_progress_trackers()
 
-    try:
-        port, workers = (args + [None] * 2)[0:2]
-        if port is None:
-            logging.error('Must provide fileserver port')
-            sys.exit(1)
-        cook_workdir = os.environ.get('COOK_WORKDIR')
-        if not cook_workdir:
-            logging.error('COOK_WORKDIR environment variable must be set')
-            sys.exit(1)
-        FileServerApplication(cook_workdir, {
-            'bind': f'0.0.0.0:{port}',
-            'workers': 4 if workers is None else workers,
-        }).run()
+    if file_server_enabled:
+        file_server.start_file_server(args)
 
-    except Exception as e:
-        logging.exception(f'exception when running with {args}')
-        sys.exit(1)
-
+    if progress_reporter_enabled:
+        progress.await_progress_trackers(progress_trackers)
 
 if __name__ == '__main__':
     main()

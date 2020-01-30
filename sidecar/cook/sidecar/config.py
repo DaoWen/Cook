@@ -1,9 +1,28 @@
-#!/usr/bin/env python3
+#
+#  Copyright (c) 2020 Two Sigma Open Source, LLC
+#
+#  Permission is hereby granted, free of charge, to any person obtaining a copy
+#  of this software and associated documentation files (the "Software"), to
+#  deal in the Software without restriction, including without limitation the
+#  rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+#  sell copies of the Software, and to permit persons to whom the Software is
+#  furnished to do so, subject to the following conditions:
+#
+#  The above copyright notice and this permission notice shall be included in
+#  all copies or substantial portions of the Software.
+#
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+#  IN THE SOFTWARE.
+#
+"""Configuration loading for Cook's sidecar progress reporter."""
 
 import logging
 import os
-
-DEFAULT_PROGRESS_FILE_ENV_VARIABLE = 'EXECUTOR_PROGRESS_OUTPUT_FILE'
 
 
 class ProgressReporterConfig(object):
@@ -62,7 +81,7 @@ def initialize_config(environment):
         default_progress_output_file = default_progress_output_name
 
     progress_output_env_key = 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV'
-    progress_output_env_variable = environment.get(progress_output_env_key, DEFAULT_PROGRESS_FILE_ENV_VARIABLE)
+    progress_output_env_variable = environment.get(progress_output_env_key, 'EXECUTOR_PROGRESS_OUTPUT_FILE')
     logging.info(f'Progress location environment variable is {progress_output_env_variable}')
     if progress_output_env_variable not in environment:
         logging.info(f'No entry found for {progress_output_env_variable} in the environment')

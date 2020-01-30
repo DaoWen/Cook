@@ -1,8 +1,26 @@
 #!/usr/bin/env python3
-
-"""The primary entry point for Cook's custom executor.
-This module configures logging and starts the executor's driver thread.
-"""
+#
+#  Copyright (c) 2020 Two Sigma Open Source, LLC
+#
+#  Permission is hereby granted, free of charge, to any person obtaining a copy
+#  of this software and associated documentation files (the "Software"), to
+#  deal in the Software without restriction, including without limitation the
+#  rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+#  sell copies of the Software, and to permit persons to whom the Software is
+#  furnished to do so, subject to the following conditions:
+#
+#  The above copyright notice and this permission notice shall be included in
+#  all copies or substantial portions of the Software.
+#
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+#  IN THE SOFTWARE.
+#
+"""Entrypoint for Cook's sidecar progress reporter."""
 
 import faulthandler
 import logging
@@ -84,22 +102,26 @@ def start_progress_trackers():
         return None
 
 
-def main(args=None):
-    logging.info(f'Starting cook.sidecar {__version__} progress reporter')
-    if len(sys.argv) == 2 and sys.argv[1] == "--version":
-        print(__version__)
-    else:
-        log_level = os.environ.get('SIDECAR_LOG_LEVEL', 'INFO')
-        logging.basicConfig(level = log_level,
-                            stream = sys.stderr,
-                            format='%(asctime)s %(levelname)s %(message)s')
-        progress_trackers = start_progress_trackers()
+def await_progress_trackers(progress_trackers):
         if progress_trackers is None:
             sys.exit('Failed to start progress trackers')
         # wait for all background threads to exit
         # (but this process will probably be killed first instead)
         for progress_tracker in progress_trackers:
             progress_tracker.join()
+
+
+def main():
+    log_level = os.environ.get('EXECUTOR_LOG_LEVEL', 'INFO')
+    logging.basicConfig(level = log_level,
+                        stream = sys.stderr,
+                        format='%(asctime)s %(levelname)s %(message)s')
+    if len(sys.argv) == 2 and sys.argv[1] == "--version":
+        print(__version__)
+    else:
+        logging.info(f'Starting cook.sidecar {__version__} progress reporter')
+        progress_trackers = start_progress_trackers()
+        await_progress_trackers(progress_trackers)
 
 
 if __name__ == '__main__':

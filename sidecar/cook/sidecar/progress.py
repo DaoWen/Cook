@@ -21,7 +21,8 @@ def start_progress_trackers():
         config = csc.initialize_config(os.environ)
 
         def send_progress_message(message):
-            requests.post(config.callback_url, json=message)
+            response = requests.post(config.callback_url, allow_redirects=True, json=message)
+            return response.status_code == 202
 
         max_message_length = config.max_message_length
         sample_interval_ms = config.progress_sample_interval_ms

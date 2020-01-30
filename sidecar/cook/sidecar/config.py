@@ -72,6 +72,7 @@ def initialize_config(environment):
     progress_sample_interval_ms = max(int(environment.get('PROGRESS_SAMPLE_INTERVAL_MS', 1000)), 100)
     sandbox_directory = environment.get('COOK_WORKDIR', '')
 
+    logging.info(f'Job instance UUID is {instance_id}')
     logging.info(f'Progress update callback url is {callback_url}')
     logging.info(f'Max bytes read per line is {max_bytes_read_per_line}')
     logging.info(f'Progress message length is limited to {max_message_length}')

@@ -531,7 +531,7 @@
         (.setWorkingDir container sidecar-workdir)
         (.setPorts container [(.containerPort (V1ContainerPort.) (int port))])
 
-        (.setEnv container [(make-env "COOK_INSTANCE_ID" task-id)
+        (.setEnv container [(make-env "COOK_INSTANCE_UUID" task-id)
                             (make-env "COOK_SCHEDULER_REST_URL" (config/scheduler-rest-url))
                             (make-env "COOK_WORKDIR" workdir)])
 

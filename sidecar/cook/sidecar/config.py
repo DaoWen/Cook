@@ -32,7 +32,8 @@ class ProgressReporterConfig(object):
                  callback_url,
                  max_bytes_read_per_line,
                  max_message_length,
-                 max_post_redirect_follow,
+                 max_post_attempts,
+                 max_post_time_secs,
                  progress_output_env_variable,
                  progress_output_name,
                  progress_regex_string,
@@ -41,7 +42,8 @@ class ProgressReporterConfig(object):
         self.callback_url = callback_url
         self.max_bytes_read_per_line = max_bytes_read_per_line
         self.max_message_length = max_message_length
-        self.max_post_redirect_follow = max_post_redirect_follow
+        self.max_post_attempts = max_post_attempts
+        self.max_post_time_secs = max_post_attempts
         self.progress_output_env_variable = progress_output_env_variable
         self.progress_output_name = progress_output_name
         self.progress_regex_string = progress_regex_string
@@ -81,23 +83,29 @@ def initialize_config(environment):
         default_progress_output_file = default_progress_output_name
 
     progress_output_env_key = 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV'
-    progress_output_env_variable = environment.get(progress_output_env_key, 'EXECUTOR_PROGRESS_OUTPUT_FILE')
+    progress_output_env_variable = environment.get(progress_output_env_key, default_progress_output_key)
     logging.info(f'Progress location environment variable is {progress_output_env_variable}')
     if progress_output_env_variable not in environment:
         logging.info(f'No entry found for {progress_output_env_variable} in the environment')
 
     max_bytes_read_per_line = max(int(environment.get('EXECUTOR_MAX_BYTES_READ_PER_LINE', 4 * 1024)), 128)
     max_message_length = max(int(environment.get('EXECUTOR_MAX_MESSAGE_LENGTH', 512)), 64)
-    max_post_redirect_follow = max(int(environment.get('PROGRESS_MAX_POST_REDIRECTS', 5)), 1)
+    max_post_attempts = max(int(environment.get('PROGRESS_MAX_POST_ATTEMPTS', 5)), 1)
+    max_post_time_secs = float(environment.get('PROGRESS_MAX_POST_TIME_SECS', 10.0))
     progress_output_name = environment.get(progress_output_env_variable, default_progress_output_file)
     progress_regex_string = environment.get('PROGRESS_REGEX_STRING', r'progress: ([0-9]*\.?[0-9]+), (.*)')
     progress_sample_interval_ms = max(int(environment.get('PROGRESS_SAMPLE_INTERVAL_MS', 1000)), 100)
     sandbox_directory = environment.get('COOK_WORKDIR', '')
 
+    if sandbox_directory and not progress_output_name.startswith('/'):
+        progress_output_name = os.path.join(sandbox_directory, progress_output_name)
+
     logging.info(f'Job instance UUID is {instance_id}')
     logging.info(f'Progress update callback url is {callback_url}')
     logging.info(f'Max bytes read per line is {max_bytes_read_per_line}')
     logging.info(f'Progress message length is limited to {max_message_length}')
+    logging.info(f'Progress post attempts limit is {max_post_attempts}')
+    logging.info(f'Post request timeout {max_post_time_secs}')
     logging.info(f'Progress output file is {progress_output_name}')
     logging.info(f'Progress regex is {progress_regex_string}')
     logging.info(f'Progress sample interval is {progress_sample_interval_ms}')
@@ -106,7 +114,8 @@ def initialize_config(environment):
     return ProgressReporterConfig(callback_url=callback_url,
                                   max_bytes_read_per_line=max_bytes_read_per_line,
                                   max_message_length=max_message_length,
-                                  max_post_redirect_follow=max_post_redirect_follow,
+                                  max_post_attempts=max_post_attempts,
+                                  max_post_time_secs=max_post_time_secs,
                                   progress_output_env_variable=progress_output_env_variable,
                                   progress_output_name=progress_output_name,
                                   progress_regex_string=progress_regex_string,

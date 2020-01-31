@@ -44,8 +44,8 @@ def start_progress_trackers():
         def send_progress_message(message):
             nonlocal current_url
             try:
-                for i in range(config.max_post_redirect_follow + 1):
-                    response = requests.post(current_url, allow_redirects=False, json=message)
+                for i in range(config.max_post_attempts):
+                    response = requests.post(current_url, allow_redirects=False, timeout=config.max_post_time_secs, json=message)
                     if response.status_code == 202:
                         return True
                     elif response.is_redirect and response.status_code == 307:

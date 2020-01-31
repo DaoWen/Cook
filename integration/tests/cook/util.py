@@ -842,18 +842,20 @@ def wait_for_exit_code(cook_url, job_id, max_wait_ms=DEFAULT_TIMEOUT_MS):
     return job['instance-with-exit-code']
 
 
-def wait_for_sandbox_directory(cook_url, job_id, status=None):
+def wait_for_output_url(cook_url, job_id, status=None):
     """
-    Wait for the given job's sandbox_directory field to appear.
+    Wait for the given job's output_url field to appear.
     Returns an up-to-date job description object on success,
     and raises an exception if the max_wait_ms wait time is exceeded.
     """
     job_id = unpack_uuid(job_id)
 
+    max_wait_ms = 4 * 60 * 1000
     cook_settings = settings(cook_url)
-    cache_ttl_ms = cook_settings['agent-query-cache']['ttl-ms']
-    sync_interval_ms = cook_settings['sandbox-syncer']['sync-interval-ms']
-    max_wait_ms = min(4 * max(cache_ttl_ms, sync_interval_ms), 4 * 60 * 1000)
+    if 'sandbox-syncer' in cook_settings:
+        cache_ttl_ms = cook_settings['agent-query-cache']['ttl-ms']
+        sync_interval_ms = cook_settings['sandbox-syncer']['sync-interval-ms']
+        #max_wait_ms = min(max_wait_ms, 4 * max(cache_ttl_ms, sync_interval_ms))
 
     def query():
         response = query_jobs(cook_url, True, uuid=[job_id])
@@ -864,18 +866,18 @@ def wait_for_sandbox_directory(cook_url, job_id, status=None):
             logger.info(f"Job {job_id} has no instances.")
         else:
             for inst in job['instances']:
-                if 'sandbox_directory' not in inst:
-                    logger.info(f"Job {job_id} instance {inst['task_id']} has no sandbox directory.")
+                if 'output_url' not in inst:
+                    logger.info(f"Job {job_id} instance {inst['task_id']} has no output url.")
                 elif status is not None and inst['status'] != status:
                     logger.info(f"Job {job_id} instance {inst['task_id']} has status {inst['status']}")
                 else:
                     logger.info(
-                        f"Job {job_id} instance {inst['task_id']} has sandbox directory {inst['sandbox_directory']}.")
+                        f"Job {job_id} instance {inst['task_id']} has output url {inst['output_url']}.")
                     return True
 
     job = wait_until(query, predicate, max_wait_ms=max_wait_ms, wait_interval_ms=250)
     for inst in job['instances']:
-        if 'sandbox_directory' in inst and (status is None or inst['status'] == status):
+        if 'output_url' in inst and (status is None or inst['status'] == status):
             return inst
 
 
@@ -939,7 +941,7 @@ def get_mesos_slaves(mesos_url):
     return session.get('%s/slaves' % mesos_url).json()
 
 
-def wait_for_output_url(cook_url, job_uuid):
+def xwait_for_output_url(cook_url, job_uuid):
     """
     Wait for the output_url for the given job to be populated,
     retrying every 5 seconds for a maximum of 2 minutes.
@@ -1043,20 +1045,22 @@ def sleep_for_publish_interval(cook_url):
 
 
 def progress_line(cook_url, percent, message, write_to_file=False):
-    """Simple text replacement of regex string using expected patterns of (\d+), (?: )? and (.*)."""
+    """Simple text replacement of regex string using expected patterns of ([0-9]+), (?: )? and (.*)."""
     cook_settings = settings(cook_url)
     regex_string = get_in(cook_settings, 'executor', 'default-progress-regex-string')
+    percent_pattern = r'([0-9]*\.?[0-9]+)'
+    message_pattern = r'($|\s+.*)'
 
     if not regex_string:
-        regex_string = 'progress:\s+([0-9]*\.?[0-9]+)($|\s+.*)'
-    if '([0-9]*\.?[0-9]+)' not in regex_string:
-        raise Exception(f'([0-9]*\.?[0-9]+) not present in {regex_string} regex string')
-    if '($|\s+.*)' not in regex_string:
-        raise Exception(f'($|\s+.*) not present in {regex_string} regex string')
+        regex_string = r'progress:\s+([0-9]*\.?[0-9]+)($|\s+.*)'
+    if percent_pattern not in regex_string:
+        raise Exception(f'{percent_pattern} not present in {regex_string} regex string')
+    if message_pattern not in regex_string:
+        raise Exception(f'{message_pattern} not present in {regex_string} regex string')
     progress_string = (regex_string
-                       .replace('([0-9]*\.?[0-9]+)', str(percent))
-                       .replace('($|\s+.*)', str(f' {message}'))
-                       .replace('\s+', ' ')
+                       .replace(percent_pattern, str(percent))
+                       .replace(message_pattern, str(f' {message}'))
+                       .replace('\\s+', ' ')
                        .replace('\\', ''))
     if write_to_file:
         progress_env = retrieve_progress_file_env(cook_url)

@@ -586,7 +586,7 @@ class CookTest(util.CookTest):
         self.assertEqual(25, instance['progress'], message)
         self.assertEqual('Twenty-five percent in progress.txt', instance['progress_message'], message)
 
-    @unittest.skipUnless(util.is_job_progress_supported(), 'Test depends on progress reporting')
+    #@unittest.skipUnless(util.is_job_progress_supported(), 'Test depends on progress reporting')
     def test_configurable_progress_update_submit(self):
         job_executor_type = util.get_job_executor_type()
         command = 'echo "message: 25 Twenty-five percent" > progress_file.txt; sleep 1; exit 0'
@@ -600,11 +600,12 @@ class CookTest(util.CookTest):
         self.assertEqual('message: (\\d*) (.*)', job['progress_regex_string'], message)
         self.assertEqual('success', job['state'], message)
 
-        instance = util.wait_for_sandbox_directory(self.cook_url, job_uuid, 'success')
+        #instance = util.wait_for_sandbox_directory(self.cook_url, job_uuid, 'success')
+        instance = util.wait_for_output_url(self.cook_url, job_uuid, 'success')
         message = json.dumps(instance, sort_keys=True)
         self.assertIsNotNone(instance['output_url'], message)
-        self.assertIsNotNone(instance['sandbox_directory'], message)
-        self.assertEqual('cook', instance['executor'])
+        #self.assertIsNotNone(instance['sandbox_directory'], message)
+        #self.assertEqual('cook', instance['executor'])
         util.sleep_for_publish_interval(self.cook_url)
         instance = util.wait_for_exit_code(self.cook_url, job_uuid)
         message = json.dumps(instance, sort_keys=True)

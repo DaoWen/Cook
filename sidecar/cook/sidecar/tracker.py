@@ -308,22 +308,34 @@ class ProgressTracker(object):
         self.watcher = ProgressWatcher(location, location_tag, counter, config.max_bytes_read_per_line, config.progress_regex_string)
         self.updater = progress_updater
         self.tracker_thread = Thread(target=self.track_progress, args=(), daemon=True)
+        self.stop_event = Event()
 
     def start(self):
         """Launches a thread that starts monitoring the progress location for progress messages."""
         logging.info(f'Starting progress monitoring from [tag={self.location_tag}]')
         self.tracker_thread.start()
 
-    def join(self):
-        """Joins the monitoring thread for this object."""
-        self.tracker_thread.join()
+    def stop(self):
+        """Signal this progress tracker thread to stop."""
+        logging.info(f'Stop signal received on progress monitoring thread [tag={self.location_tag}]')
+        self.stop_event.set()
+
+    def stopped(self):
+        """Check if this progress tracker has been stopped."""
+        return self.stop_event.is_set()
+
+    def wait(self):
+        """Wait for this progress tracker to complete."""
+        while self.tracker_thread.is_alive() and not self.stopped():
+            self.tracker_thread.join(0.01)
         logging.info(f'Completed progress monitoring from [tag={self.location_tag}]')
 
     def track_progress(self):
         """Retrieves and sends progress updates using send_progress_update_fn."""
         try:
             for current_progress in self.watcher.retrieve_progress_states():
-                self.updater.send_progress_update(current_progress)
+                if not self.stopped():
+                    self.updater.send_progress_update(current_progress)
         except Exception:
             logging.exception(f'Exception while tracking progress [tag={self.location_tag}]')
 

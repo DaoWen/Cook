@@ -80,12 +80,11 @@ def start_progress_trackers():
         progress_trackers = [launch_progress_tracker(file, name) for file, name in progress_locations.items()]
 
         def handle_interrupt(interrupt_code, _):
-            msg = f'Progress Reporter interrupted with code {interrupt_code}'
-            logging.info(msg)
-            # force send the latest progress state if available
+            logging.info(f'Progress Reporter interrupted with code {interrupt_code}')
+            # force send the latest progress state if available, and stop the tracker
             for progress_tracker in progress_trackers:
                 progress_tracker.force_send_progress_update()
-            sys.exit(msg)
+                progress_tracker.stop()
 
         signal.signal(signal.SIGINT, handle_interrupt)
         signal.signal(signal.SIGTERM, handle_interrupt)
@@ -108,7 +107,7 @@ def await_progress_trackers(progress_trackers):
         # wait for all background threads to exit
         # (but this process will probably be killed first instead)
         for progress_tracker in progress_trackers:
-            progress_tracker.join()
+            progress_tracker.wait()
 
 
 def main():

@@ -75,18 +75,19 @@ def initialize_config(environment):
     callback_url = f'{cook_scheduler_rest_url}/progress/{instance_id}'
 
     sandbox_directory = environment.get('COOK_WORKDIR', '')
-    default_progress_output_key = 'EXECUTOR_DEFAULT_PROGRESS_OUTPUT_NAME'
-    default_progress_output_name = environment.get(default_progress_output_key, f'{instance_id}.progress')
-    if sandbox_directory:
-        default_progress_output_file = os.path.join(sandbox_directory, default_progress_output_name)
-    else:
-        default_progress_output_file = default_progress_output_name
 
+    default_progress_output_key = 'EXECUTOR_PROGRESS_OUTPUT_FILE_NAME'
     progress_output_env_key = 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV'
     progress_output_env_variable = environment.get(progress_output_env_key, default_progress_output_key)
     logging.info(f'Progress location environment variable is {progress_output_env_variable}')
     if progress_output_env_variable not in environment:
         logging.info(f'No entry found for {progress_output_env_variable} in the environment')
+
+    default_progress_output_name = environment.get(progress_output_env_variable, f'{instance_id}.progress')
+    if sandbox_directory:
+        default_progress_output_file = os.path.join(sandbox_directory, default_progress_output_name)
+    else:
+        default_progress_output_file = default_progress_output_name
 
     max_bytes_read_per_line = max(int(environment.get('EXECUTOR_MAX_BYTES_READ_PER_LINE', 4 * 1024)), 128)
     max_message_length = max(int(environment.get('EXECUTOR_MAX_MESSAGE_LENGTH', 512)), 64)

@@ -421,6 +421,7 @@
         (swap! k8s-actual-state-map assoc pod-name new-state)
         (let [new-file-server-state (:sandbox-file-server-container-state new-state)
               old-file-server-state (:sandbox-file-server-container-state old-state)]
+          (log/info :sidecar-state {:old old-file-server-state :new new-file-server-state})
           (when (and (= new-file-server-state :running) (not= old-file-server-state :running))
             (record-sandbox-url new-state)))
         (when-not (k8s-actual-state-equivalent? old-state new-state)

@@ -396,10 +396,9 @@
 (defn filter-env-vars
   [env-vars]
   (let [{:keys [disallowed-var-names]} (config/kubernetes)]
-    (->> env-vars
-         (filter (fn [^V1EnvVar var]
-                   (not (contains? disallowed-var-names (.getName var)))))
-         (into []))))
+    (filterv (fn [^V1EnvVar var]
+               (not (contains? disallowed-var-names (.getName var))))
+             env-vars)))
 
 (defn- add-as-decimals
   "Takes two doubles and adds them as decimals to avoid floating point error. Kubernetes will not be able to launch a
@@ -478,7 +477,13 @@
         sidecar-workdir-volume-mount-fn (partial make-volume-mount sidecar-workdir-volume sidecar-workdir)
         workdir-env-vars [(make-env "HOME" workdir)
                           (make-env "MESOS_SANDBOX" workdir)
-                          (make-env "SIDECAR_WORKDIR" sidecar-workdir)]]
+                          (make-env "SIDECAR_WORKDIR" sidecar-workdir)]
+        progress-env-vars (concat
+                            (when progress-regex-string
+                              [(make-env "PROGRESS_REGEX_STRING" progress-regex-string)])
+                            (when progress-output-file
+                              [(make-env "EXECUTOR_PROGRESS_OUTPUT_FILE_ENV" "EXECUTOR_PROGRESS_OUTPUT_FILE_NAME")
+                               (make-env "EXECUTOR_PROGRESS_OUTPUT_FILE_NAME" progress-output-file)]))]
 
     ; metadata
     (.setName metadata (str task-id))
@@ -488,11 +493,9 @@
     ; container
     (.setName container cook-container-name-for-job)
     (.setCommand container (conj (or custom-shell ["/bin/sh" "-c"]) (:value command)))
-    (.setEnv container (-> []
-                           (into env)
-                           (into (param-env-vars parameters))
-                           (into workdir-env-vars)
-                           filter-env-vars))
+    (.setEnv container (filter-env-vars
+                              ;; NOTE: there may be additional env vars hard-coded in the docker container
+                              (concat env (param-env-vars parameters) workdir-env-vars progress-env-vars)))
     (.setImage container image)
 
     (.putRequestsItem resources "memory" (double->quantity (* memory-multiplier mem)))
@@ -540,15 +543,11 @@
         (.setEnv container (into
                              ;; NOTE: there may be additional env vars hard-coded in the docker container
                              (filterv sidecar-env-filter env)
-                             (concat
-                               [(make-env "COOK_INSTANCE_UUID" task-id)
-                                (make-env "COOK_SCHEDULER_REST_URL" (config/scheduler-rest-url))
-                                (make-env "COOK_WORKDIR" workdir)]
-                               (when progress-regex-string
-                                 [(make-env "PROGRESS_REGEX_STRING" progress-regex-string)])
-                               (when progress-output-file
-                                 [(make-env "EXECUTOR_PROGRESS_OUTPUT_FILE_ENV" "EXECUTOR_PROGRESS_OUTPUT_FILE_NAME")
-                                  (make-env "EXECUTOR_PROGRESS_OUTPUT_FILE_NAME" progress-output-file)]))))
+                             (list*
+                               (make-env "COOK_INSTANCE_UUID" task-id)
+                               (make-env "COOK_SCHEDULER_REST_URL" (config/scheduler-rest-url))
+                               (make-env "COOK_WORKDIR" workdir)
+                               progress-env-vars)))
 
         (.setPort http-get-action (-> port int IntOrString.))
         (.setPath http-get-action "readiness-probe")

@@ -22,13 +22,16 @@
 #
 """Module implementing the Mesos file access REST API to serve Cook job logs. """
 
+import logging
 import os
+import signal
 import sys
 from operator import itemgetter
 from pathlib import Path
 from stat import *
 
 import gunicorn.app.base
+import gunicorn.arbiter
 from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
@@ -56,6 +59,25 @@ def start_file_server(args):
         sys.exit(1)
 
 
+class FileServerArbiter(gunicorn.arbiter.Arbiter):
+    def __init__(self, app):
+        self.user_signal_handlers = {}
+        for sig in range(1, signal.NSIG):
+            user_handler = signal.getsignal(sig)
+            if callable(user_handler):
+                logging.info(f'Saving user handler for signal {sig}')
+                self.user_signal_handlers[sig] = user_handler
+        super().__init__(app)
+
+    def signal(self, sig, frame):
+        user_handler = self.user_signal_handlers.get(sig)
+        if user_handler is not None:
+            logging.info(f'Entering user handler for signal {sig}')
+            user_handler(sig, frame)
+            logging.info(f'Exiting user handler for signal {sig}')
+        super().signal(sig, frame)
+
+
 class FileServerApplication(gunicorn.app.base.BaseApplication):
 
     def __init__(self, cook_workdir, options=None):
@@ -72,6 +94,12 @@ class FileServerApplication(gunicorn.app.base.BaseApplication):
 
     def load(self):
         return self.application
+
+    def run(self):
+        try:
+            FileServerArbiter(self).run()
+        except RuntimeError as e:
+            logging.exception('Error while running cook.sidecar file server')
 
 
 def path_is_valid(path):

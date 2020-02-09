@@ -612,9 +612,10 @@ class CookTest(util.CookTest):
         line_3 = util.progress_line(self.cook_url, '', 'Sixty percent invalid format', True)
         line_4 = util.progress_line(self.cook_url, 75, 'Seventy-five percent', True)
         line_5 = util.progress_line(self.cook_url, '', 'Eighty percent invalid format', True)
-        command = f'{line_1} && sleep 2 && {line_2} && sleep 2 && ' \
-                  f'{line_3} && sleep 2 && {line_4} && sleep 2 && ' \
-                  f'{line_5} && sleep 2 && echo "Done" && exit 0'
+        command = ('env; '
+                   f'{line_1} && sleep 2 && {line_2} && sleep 2 && '
+                   f'{line_3} && sleep 2 && {line_4} && sleep 2 && '
+                   f'{line_5} && sleep 2 && echo "Done" && exit 0')
         job_uuid, resp = util.submit_job(self.cook_url, command=command, executor=job_executor_type,
                                          max_runtime=60000, max_retries=5)
         self.assertEqual(201, resp.status_code, msg=resp.content)

@@ -4,6 +4,7 @@
             [clojure.tools.logging :as log]
             [datomic.api :as d]
             [cook.config :as config]
+            [cook.task :as task]
             [cook.tools :as util]
             [plumbing.core :as pc])
   (:import
@@ -46,11 +47,6 @@
 ; Cook, Fenzo, and Mesos use MB for memory. Convert bytes from k8s to MB when passing to fenzo, and MB back to bytes
 ; when submitting to k8s.
 (def memory-multiplier (* 1000 1000))
-
-(defn sidecar-env-filter
-  "Predicate for filtering user environment variables to include in the sidecar container."
-  [^V1EnvVar env-var]
-  (->> env-var .getName (re-find #"^(?:EXECUTOR|PROGRESS)_")))
 
 (defn is-cook-scheduler-pod
   "Is this a cook pod? Uses some-> so is null-safe."
@@ -568,12 +564,7 @@
         workdir-env-vars [(make-env "HOME" workdir)
                           (make-env "MESOS_SANDBOX" workdir)
                           (make-env "SIDECAR_WORKDIR" sidecar-workdir)]
-        progress-env-vars (concat
-                            (when progress-regex-string
-                              [(make-env "PROGRESS_REGEX_STRING" progress-regex-string)])
-                            (when progress-output-file
-                              [(make-env "EXECUTOR_PROGRESS_OUTPUT_FILE_ENV" "EXECUTOR_PROGRESS_OUTPUT_FILE_NAME")
-                               (make-env "EXECUTOR_PROGRESS_OUTPUT_FILE_NAME" progress-output-file)]))]
+        progress-env-vars (mapv (fn [[k v]] (make-env k (str v))) (task/build-executor-environment job))]
 
     ; metadata
     (.setName metadata (str task-id))
@@ -631,14 +622,11 @@
           (.setWorkingDir container sidecar-workdir)
           (.setPorts container [(.containerPort (V1ContainerPort.) (int port))])
 
-          (.setEnv container (into
-                               ;; NOTE: there may be additional env vars hard-coded in the docker container
-                               (filterv sidecar-env-filter env)
-                               (list*
-                                 (make-env "COOK_INSTANCE_UUID" task-id)
-                                 (make-env "COOK_SCHEDULER_REST_URL" (config/scheduler-rest-url))
-                                 (make-env "COOK_WORKDIR" workdir)
-                                 progress-env-vars)))
+          (.setEnv container (conj ;; NOTE: there may be additional env vars hard-coded in the docker container
+                                   progress-env-vars
+                                   (make-env "COOK_INSTANCE_UUID" task-id)
+                                   (make-env "COOK_SCHEDULER_REST_URL" (config/scheduler-rest-url))
+                                   (make-env "COOK_WORKDIR" workdir)))
 
           (.setPort http-get-action (-> port int IntOrString.))
           (.setPath http-get-action "readiness-probe")

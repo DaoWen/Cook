@@ -1268,11 +1268,8 @@ def retrieve_progress_file_env(cook_url):
     """Retrieves the environment variable used by the cook executor to lookup the progress file."""
     cook_settings = settings(cook_url)
     default_env_value = 'EXECUTOR_PROGRESS_OUTPUT_FILE'
-    if using_kubernetes():
-        return default_env_value
-    else:
-        env_value = get_in(cook_settings, 'executor', 'environment', 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV')
-        return env_value or default_env_value
+    env_value = get_in(cook_settings, 'executor', 'environment', 'EXECUTOR_PROGRESS_OUTPUT_FILE_ENV')
+    return env_value or default_env_value
 
 
 def get_instance_stats(cook_url, **kwargs):

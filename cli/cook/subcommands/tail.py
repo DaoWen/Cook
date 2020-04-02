@@ -105,8 +105,8 @@ def tail_follow(file_size, read_fn, follow_sleep_seconds):
         time.sleep(follow_sleep_seconds)
 
 class Tail:
-    def read_file_mesos(self, instance, sandbox_dir, path):
-        return read_file(instance, sandbox_dir, path)
+    def read_file_mesos(self, instance, sandbox_dir, path, offset=None, length=None):
+        return read_file(instance, sandbox_dir, path, offset, length)
 
     def tail_using_read_file(self, instance, sandbox_dir, path, num_lines_to_print, follow, follow_sleep_seconds):
         read = partial(self.read_file_mesos, instance=instance, sandbox_dir=sandbox_dir, path=path)

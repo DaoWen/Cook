@@ -2,7 +2,7 @@ import argparse
 import logging
 from urllib.parse import urlparse
 
-from cook import util, http, metrics, version, configuration, plugins
+from cook import util, http, metrics, version, configuration
 from cook.subcommands import submit, show, wait, jobs, ssh, ls, tail, kill, config, cat, usage
 from cook.util import deep_merge
 
@@ -94,7 +94,6 @@ def run(args, dependency_overrides):
             metrics.inc('command.%s.runs' % action)
             clusters = load_target_clusters(config_map, url, cluster)
             http.configure(config_map)
-            plugins.configure(config_map)
             args = {k: v for k, v in args.items() if v is not None}
             defaults = config_map.get('defaults')
             action_defaults = (defaults.get(action) if defaults else None) or {}

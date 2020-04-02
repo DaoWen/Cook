@@ -75,24 +75,28 @@ def browse_files(instance, sandbox_dir, path):
     return resp.json()
 
 
-class Listing:
-    def retrieve_entries_from_mesos(self, instance, sandbox_dir, path):
-        """Retrieves the contents of the Mesos sandbox path for the given instance"""
-        entries = browse_files(instance, sandbox_dir, path)
-        if len(entries) == 0 and path:
-            # Mesos will return 200 with an empty list in two cases:
-            # - the provided path is a file (this is odd)
-            # - the provided path is an empty directory (this one makes sense)
-            # In the former case, we want to return the entry for that file to the user
-            parent_entries = browse_files(instance, sandbox_dir, os.path.dirname(path))
-            child_entries = [e for e in parent_entries if basename(e['path']) == basename(path)]
-            if len(child_entries) > 0 and not is_directory(child_entries[0]):
-                entries = child_entries
+def retrieve_entries_from_mesos(instance, sandbox_dir, path):
+    """Retrieves the contents of the Mesos sandbox path for the given instance"""
+    entries = browse_files(instance, sandbox_dir, path)
+    if len(entries) == 0 and path:
+        # Mesos will return 200 with an empty list in two cases:
+        # - the provided path is a file (this is odd)
+        # - the provided path is an empty directory (this one makes sense)
+        # In the former case, we want to return the entry for that file to the user
+        parent_entries = browse_files(instance, sandbox_dir, os.path.dirname(path))
+        child_entries = [e for e in parent_entries if basename(e['path']) == basename(path)]
+        if len(child_entries) > 0 and not is_directory(child_entries[0]):
+            entries = child_entries
 
-        return entries
+    return entries
+
+class Listing:
+    def retrieve_job_instance_files(self, instance, sandbox_dir, path):
+        """Plugin interface: Retrieves the contents of the sandbox path for the given instance"""
+        return retrieve_entries_from_mesos(instance, sandbox_dir, path)
 
     def ls_for_instance_from_mesos(self, instance, sandbox_dir, path, long_format, as_json):
-        entries = self.retrieve_entries_from_mesos(instance, sandbox_dir, path)
+        entries = self.retrieve_job_instance_files(instance, sandbox_dir, path)
         if as_json:
             print(json.dumps(entries))
         else:

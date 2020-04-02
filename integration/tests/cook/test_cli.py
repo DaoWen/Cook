@@ -1096,23 +1096,27 @@ def dummy_tail_text(instance, sandbox_dir, path, offset=None, length=None):
             path1 = str(util.make_temporal_uuid())
             path2 = str(util.make_temporal_uuid())
             plugin_code = f"""
-def dummy_ls_entries(_, __, ___):
-    return [
-        {{'path': '{path1}', 'nlink': 1, 'mode': '-rw-r--r--', 'size': 0}},
-        {{'path': '{path2}', 'nlink': 2, 'mode': 'drwxr-xr-x', 'size': 1}}
-    ]"""
+from cook.__main__ import main as super_main
+from cook.subcommands.ls import Listing
+
+class DummyListing(Listing):
+    def retrieve_job_instance_files(self, instance, sandbox_dir, path):
+        return [
+            {{'path': '{path1}', 'nlink': 1, 'mode': '-rw-r--r--', 'size': 0}},
+            {{'path': '{path2}', 'nlink': 2, 'mode': 'drwxr-xr-x', 'size': 1}}
+        ]
+
+def main():
+    super_main(args=None, dependency_overrides=dict(ls=DummyListing))
+
+if __name__ == '__main__':
+    main()
+"""
             temp.write(plugin_code.encode())
             temp.flush()
-            config = {
-                "plugins": {
-                    "retrieve-job-instance-files": {
-                        "module-name": "does_not_matter",
-                        "path": temp.name,
-                        "function-name": "dummy_ls_entries"
-                    }
-                }}
-            with cli.temp_config_file(config) as path:
-                flags = f'--config {path} --verbose'
+
+            with cli.temp_command_env(temp.name):
+                flags = f'--verbose'
                 cp, entries = cli.ls(uuids[0], self.cook_url, flags=flags)
                 self.assertEqual(0, cp.returncode, cp.stderr)
                 self.assertEqual(2, len(entries))

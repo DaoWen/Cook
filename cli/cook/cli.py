@@ -18,19 +18,21 @@ parser.add_argument('--version', help='output version information and exit',
 
 subparsers = parser.add_subparsers(dest='action')
 
-actions = {
-    'cat': cat.register(subparsers.add_parser, configuration.add_defaults),
-    'config': config.register(subparsers.add_parser, configuration.add_defaults),
-    'jobs': jobs.register(subparsers.add_parser, configuration.add_defaults),
-    'kill': kill.register(subparsers.add_parser, configuration.add_defaults),
-    'ls': ls.register(subparsers.add_parser, configuration.add_defaults),
-    'show': show.register(subparsers.add_parser, configuration.add_defaults),
-    'ssh': ssh.register(subparsers.add_parser, configuration.add_defaults),
-    'submit': submit.register(subparsers.add_parser, configuration.add_defaults),
-    'tail': tail.register(subparsers.add_parser, configuration.add_defaults),
-    'usage': usage.register(subparsers.add_parser, configuration.add_defaults),
-    'wait': wait.register(subparsers.add_parser, configuration.add_defaults)
-}
+def build_actions(dependency_overrides):
+    register_args = [subparsers.add_parser, configuration.add_defaults, dependency_overrides]
+    return {
+        'cat': cat.register(*register_args),
+        'config': config.register(*register_args),
+        'jobs': jobs.register(*register_args),
+        'kill': kill.register(*register_args),
+        'ls': ls.register(*register_args),
+        'show': show.register(*register_args),
+        'ssh': ssh.register(*register_args),
+        'submit': submit.register(*register_args),
+        'tail': tail.register(*register_args),
+        'usage': usage.register(*register_args),
+        'wait': wait.register(*register_args)
+    }
 
 
 def load_target_clusters(config_map, url=None, cluster=None):
@@ -57,12 +59,13 @@ def load_target_clusters(config_map, url=None, cluster=None):
     return clusters
 
 
-def run(args):
+def run(args, dependency_overrides):
     """
     Main entrypoint to the cook scheduler CLI. Loads configuration files, 
     processes global command line arguments, and calls other command line 
     sub-commands (actions) if necessary.
     """
+    actions = build_actions(dependency_overrides)
     args = vars(parser.parse_args(args))
 
     util.silent = args.pop('silent')
